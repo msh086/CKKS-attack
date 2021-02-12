@@ -1,0 +1,9 @@
+[submodule "CKKSKeyRecovery"]
+	path = CKKSKeyRecovery
+	url = ../CKKSKeyRecovery
+[submodule "HElib"]
+	path = HElib
+	url = ../HElib
+[submodule "SEAL"]
+	path = SEAL
+	url = ../SEAL
