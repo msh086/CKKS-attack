@@ -57,6 +57,56 @@ public:
     }
 
     template<typename T>
+    static void element_wise_add_inplace(std::vector<T>& multiplicand, const std::vector<T>& multiplier){
+        element_wise_add(multiplicand, multiplier, multiplicand);
+    }
+
+    template<typename T>
+    static void element_wise_add(const std::vector<T>& op1, const std::vector<T>& op2, std::vector<T>& dst){
+        int len = op1.size();
+        if(len != op2.size())
+            throw std::invalid_argument("array lengths do not match");
+        dst.resize(len);
+        for(int i = 0; i < len; i++)
+            dst[i] = op1[i] + op2[i];
+    }
+
+    template<typename T>
+    static void element_wise_substract_inplace(std::vector<T>& multiplicand, const std::vector<T>& multiplier){
+        element_wise_substract(multiplicand, multiplier, multiplicand);
+    }
+
+    template<typename T>
+    static void element_wise_substract(const std::vector<T>& op1, const std::vector<T>& op2, std::vector<T>& dst){
+        int len = op1.size();
+        if(len != op2.size())
+            throw std::invalid_argument("array lengths do not match");
+        dst.resize(len);
+        for(int i = 0; i < len; i++)
+            dst[i] = op1[i] - op2[i];
+    }
+
+    template<typename T>
+    static void scale_mult(std::vector<T>& src, T factor){
+        for(auto& ele : src)
+            ele *= factor;
+    }
+
+    template<typename T>
+    static void scale_add(std::vector<T>& src, T factor){
+        for(auto& ele : src)
+            ele += factor;
+    }
+
+    template<typename T>
+    static void to_norm(const std::vector<T>& src, std::vector<double>& dst){
+        int len = src.size();
+        dst.resize(len);
+        for(int i = 0; i < len; i++)
+            dst[i] = norm(src[i]);
+    }
+
+    template<typename T>
     static double norm(std::complex<T> val){
         return std::sqrt(double(val.imag() * val.imag() + val.real() * val.real()));
     }
@@ -64,6 +114,14 @@ public:
     template<typename T>
     static double norm(T val){
         return std::abs(val);
+    }
+
+    template<typename T>
+    static T max_ele(const std::vector<T>& src){
+        T res = 0;
+        for(auto ele : src)
+            res = std::max(ele, res);
+        return res;
     }
 
     template<typename T>

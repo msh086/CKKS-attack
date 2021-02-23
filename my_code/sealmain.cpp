@@ -73,27 +73,35 @@ int main(int argc, char** argv){
     size_t scale_bit_length = 0;
     double std_dev = 0;
     double max_dev = 0;
-    std::string output_path;
+    std::string infty_norm_path, mean_var_path, complete_data_path;
     try{
         TCLAP::CmdLine cmd("CKKS key recovery for Microsoft SEAL", ' ', "0.1");
         // 3 modes, attack, defense, noise
         std::vector<std::string> allowed_modes({"attack", "defense", "noise"});
         TCLAP::ValuesConstraint<std::string> mode_constraint(allowed_modes);
         TCLAP::ValueArg<std::string> mode_arg("m", "mode", "which job to run", false, "attack", &mode_constraint, cmd);
-        // for noise mode
+
+        /// for noise mode or defense mode
+        // noise sample count
         TCLAP::ValueArg<std::size_t> noise_samp_count_arg("n", "samp_count", "how many noise samples are drawn", false, 1000, "a positive integer", cmd);
+        // std deviation
+        TCLAP::ValueArg<double> std_dev_arg("d", "std_dev", "standard deviation for gaussian distribution", false, 3.2, "a positive floating point number", cmd);
+        // dist width
+        TCLAP::ValueArg<std::size_t> max_dev_width_arg("w", "max_dev_width", "the ratio of max deviation and standard deviation", false, 6, "a positive integer", cmd);
+        // output path for infty norms
+        TCLAP::ValueArg<std::string> infty_norm_path_arg("", "inf_norm", "path to output infty norms. infty norms won't be calculated when not specified", false, "", "a path string", cmd);
+        // output path for mean and variance
+        TCLAP::ValueArg<std::string> mean_var_path_arg("", "mean_var", "path to output mean and variance for each slot. no calculation takes place when path is unspecified", false, "", "a path string", cmd);
+        // output path for complete data
+        TCLAP::ValueArg<std::string> complete_data_path_arg("", "complete_data", "path to output complete data.", false, "", "a path string", cmd);
+
+        /// for general purposes
         // modulus polynomial degree
         TCLAP::ValueArg<std::size_t> poly_logn_arg("l", "poly_logn", "log(N) where N is the degree of cyclotomic polynomial", false, 16, "a positive integer, no greater than 16", cmd);
         // special modulus
         TCLAP::ValueArg<std::size_t> special_modulus_bit_size_arg("", "special_bits", "bit length for special modulus", false, 60, "a positive integer, no greater than 60", cmd);
         // scaling factor
         TCLAP::ValueArg<std::size_t> scale_bit_size_arg("s", "scale_bits", "bit length for scaling factor", false, 40, "a positive integer, neither greater than 60 nor special_bits", cmd);
-        // std deviation
-        TCLAP::ValueArg<double> std_dev_arg("d", "std_dev", "standard deviation for gaussian distribution", false, 3.2, "a positive floating point number", cmd);
-        // dist width
-        TCLAP::ValueArg<std::size_t> max_dev_width_arg("w", "max_dev_width", "the ratio of max deviation and standard deviation", false, 6, "a positive integer", cmd);
-        // output path
-        TCLAP::ValueArg<std::string> output_path_arg("o", "output", "path to the output file", false, "output.txt", "a path string", cmd);
         // parse...
         cmd.parse(argc, argv);
         // argument assignment
@@ -104,7 +112,14 @@ int main(int argc, char** argv){
         scale_bit_length = scale_bit_size_arg.getValue();
         std_dev = std_dev_arg.getValue();
         max_dev = max_dev_width_arg.getValue() * std_dev;
-        output_path = output_path_arg.getValue();
+        infty_norm_path = infty_norm_path_arg.getValue();
+        mean_var_path = mean_var_path_arg.getValue();
+        complete_data_path = complete_data_path_arg.getValue();
+
+        if(mode == "noise" && infty_norm_path.empty() && mean_var_path.empty() && complete_data_path.empty()) {
+            printf("no job to do for mode \"noise\"\n");
+            return 0;
+        }
     }catch(TCLAP::ArgException &e){
         printf("%s for arg %s\n", e.error().c_str(), e.argId().c_str());
         return 1;
@@ -155,20 +170,67 @@ int main(int argc, char** argv){
 //        plaintext_polynomial.resize(poly_modulus_degree * coeff_modulus_size);
 //        plaintext_polynomial.parms_id() = ctxt->parms_id();
 //        plaintext_polynomial.scale() = 1;
-        std::vector<double> inf_norms;
-        inf_norms.reserve(noise_samp_count);
+        std::vector<double> *inf_norms = nullptr, *var = nullptr;
+        std::vector<std::complex<double>> *mean = nullptr;
+        FILE* complete_data_file = complete_data_path.empty() ? nullptr : fopen(complete_data_path.c_str(), "w");
+        if(infty_norm_path.length())
+            inf_norms = new std::vector<double>(noise_samp_count);
+        if(mean_var_path.length()){
+            mean = new std::vector<std::complex<double>>(slot_count);
+            var = new std::vector<double>(slot_count);
+        }
+
+        std::vector<double> norm_vector;
+
         for(size_t i = 0; i < noise_samp_count; i++){
 //            sealattack::sample_gaussian_noise(plaintext_polynomial.data(), *ctxt, 3.2, 6 * 3.2);
 //            encoder.decode(plaintext_polynomial, plaintext_vector);
             encoder.fast_noise_decode(params_id, plaintext_vector, std_dev, max_dev);
-            inf_norms.push_back(utils::infty_norm(plaintext_vector));
+            utils::to_norm(plaintext_vector, norm_vector);
+            if(complete_data_file){
+                for(int slot = 0; slot < slot_count; slot++)
+                    fprintf(complete_data_file, "%f%s%fj ", plaintext_vector[slot].real(),
+                            plaintext_vector[slot].imag() < 0 ? "" : "+", plaintext_vector[slot].imag());
+                fprintf(complete_data_file, "\n");
+            }
+            if(inf_norms)
+                (*inf_norms)[i] = utils::max_ele(norm_vector);
+            if(mean){
+                utils::element_wise_add_inplace(*mean, plaintext_vector); // sum up all ele
+                utils::element_wise_mult_inplace(norm_vector, norm_vector);
+                utils::element_wise_add_inplace(*var, norm_vector); // sum up all ||ele||^2
+            }
         }
-        printf("mean of noise is %e\n", utils::mean(inf_norms));
-        // write to file
-        auto file = fopen(output_path.c_str(), "w");
-        for(auto ele : inf_norms)
-            fprintf(file, "%f\n", ele);
-        fclose(file);
+
+        if(complete_data_file)
+            fclose(complete_data_file);
+        if(inf_norms) {
+            printf("mean of noise is %e\n", utils::mean(*inf_norms));
+            // write to file
+            auto file = fopen(infty_norm_path.c_str(), "w");
+            for (auto ele : *inf_norms)
+                fprintf(file, "%f\n", ele);
+            fclose(file);
+            delete inf_norms;
+        }
+        if(mean){
+            utils::scale_mult(*mean, std::complex<double>(1.0/noise_samp_count));
+            utils::to_norm(*mean, norm_vector);
+            utils::element_wise_mult_inplace(norm_vector, norm_vector);
+
+            utils::scale_mult(*var, 1.0/noise_samp_count);
+            utils::element_wise_substract_inplace(*var, norm_vector);
+
+            auto mean_var_file = fopen(mean_var_path.c_str(), "w");
+            for(int i = 0; i < slot_count; i++){
+                auto mean_ele = (*mean)[i];
+                fprintf(mean_var_file, "%f%s%fj %f\n", mean_ele.real(), mean_ele.imag() < 0 ? "" : "+",
+                        mean_ele.imag(), (*var)[i]);
+            }
+            fclose(mean_var_file);
+            delete mean;
+            delete var;
+        }
         return 0;
     }
 
