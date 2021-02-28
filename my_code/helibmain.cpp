@@ -46,7 +46,7 @@ void CKKS_decode(const NTL::ZZX& pp,
 int main(int argc, char** argv){
 
     Context context = ContextBuilder<CKKS>()
-            .m(1 << 17) // n = 2^12
+            .m(1 << 17) // n = 2^16
             .bits(1098) // settings for bits and c0 follow recommendation in CKKS tutorial
             .c(2)
             .precision(20)
@@ -92,7 +92,7 @@ int main(int argc, char** argv){
      *     which would be Q^2/12 in the case of uniform continuous / discrete distribution in range [0, q]
      *  3. the probability that a uniform random variable with variance sigma^2
      *     falls out of the range of [-x, x] is erfc(x/(sigma*sqrt(2))).
-     *     then the probability that it falls out of [-scale*x, scale*x] is delta = erfc(x/sqrt(2))
+     *     then the probability that it falls out of [-scale*sigma, scale*sigma] is delta = erfc(scale/sqrt(2))
      *     (here the scale has nothing to do with the scaling factor).
      *     given a vector of phi(m) elements, its infinity norm is within scale*x
      *     is no more than delta * phi(m).
@@ -119,6 +119,7 @@ int main(int argc, char** argv){
      * Extra noise is added to plaintext polynomial after decryption to mitigate CKKS attack
      * see EaCx.cpp::EncryptedArray<PA_cx>::decrypt line 88 and Ctxt.cpp::addedNoiseForCKKSDecryption line 3026
      * the PRNG seed is hashed from the secret key and ciphertext
+     * the default std-dev is 6.4 (they multiplied 3.2 by 2 to get better security)
      *
      * in Ctxt.cpp::addedNoiseForCKKSDecryption, sigma is the standard deviation of each polynomial coefficient
      * sampleGaussianBoundedEffectiveBound returns a bound factor B s.t. the decoded vector is bounded by B*sigma

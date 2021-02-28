@@ -8,40 +8,56 @@
 #include <seal/context.h>
 #include <vector>
 #include <complex>
+#include <seal/seal.h>
 
 using namespace seal;
 
-class sealattack {
-public:
-    static void add_ntt(util::ConstCoeffIter op1, util::ConstCoeffIter op2, util::CoeffIter dst,
+namespace sealattack {
+    void add_ntt(util::ConstCoeffIter op1, util::ConstCoeffIter op2, util::CoeffIter dst,
                  const std::vector<Modulus>& coeff_modulus, size_t coeff_count);
 
-    static void sub_ntt(util::ConstCoeffIter op1, util::ConstCoeffIter op2, util::CoeffIter dst,
+    void sub_ntt(util::ConstCoeffIter op1, util::ConstCoeffIter op2, util::CoeffIter dst,
                  const std::vector<Modulus>& coeff_modulus, size_t coeff_count);
 
-    static void mult_ntt(util::ConstCoeffIter op1, util::ConstCoeffIter op2, util::CoeffIter dst,
+    void mult_ntt(util::ConstCoeffIter op1, util::ConstCoeffIter op2, util::CoeffIter dst,
                   const std::vector<Modulus>& coeff_modulus, size_t coeff_count);
 
-    static bool inv_ntt(util::ConstCoeffIter src, util::CoeffIter dst,
+    bool inv_ntt(util::ConstCoeffIter src, util::CoeffIter dst,
                  const std::vector<Modulus>& coeff_modulus, size_t coeff_count);
 
-    static void multi_precision_to_crt(util::CoeffIter src, const SEALContext::ContextData &ctxt, size_t coeff_count,
+    void multi_precision_to_crt(util::CoeffIter src, const SEALContext::ContextData &ctxt, size_t coeff_count,
                                        MemoryPoolHandle& pool);
 
-    static void crt_to_multi_precision(util::CoeffIter src, const SEALContext::ContextData &ctxt, size_t coeff_count,
+    void crt_to_multi_precision(util::CoeffIter src, const SEALContext::ContextData &ctxt, size_t coeff_count,
                                        MemoryPoolHandle& pool);
 
-    static void crt_to_ntt(util::CoeffIter src, const std::vector<Modulus>& coeff_modulus,
+    void crt_to_ntt(util::CoeffIter src, const std::vector<Modulus>& coeff_modulus,
                            size_t coeff_count, const util::NTTTables* ntt_tables);
 
-    static void ntt_to_crt(util::CoeffIter src, const std::vector<Modulus>& coeff_modulus,
+    void ntt_to_crt(util::CoeffIter src, const std::vector<Modulus>& coeff_modulus,
                            size_t coeff_count, const util::NTTTables* ntt_tables);
 
-    static void multi_precision_to_double_unscaled(util::ConstCoeffIter src, std::vector<double>& dst,
+    void multi_precision_to_double_unscaled(util::ConstCoeffIter src, std::vector<double>& dst,
                                                    const SEALContext::ContextData &ctxt);
 
-    static void sample_gaussian_noise(util::CoeffIter dst, const SEALContext::ContextData &ctxt, double std_dev, double max_dev);
+    void sample_gaussian_noise(util::CoeffIter dst, const SEALContext::ContextData &ctxt, double std_dev, double max_dev);
 
+
+    /**
+     * @brief evaluate a polynomial with floating point coefficients homomorphically
+     *
+     *
+     * @param[in] coeffs: vector of coefficients, starting from low degree terms
+     * @param[in] evaluator: evaluator that performs homomorphic operations
+     * @param[in] relinKeys: relinearization keys
+     * @param[in] x: input ciphertext, the variable in the to-be-evaluated polynomial
+     * @param[out] dst: destination to store the result
+     * */
+    void evaluate_poly(const std::vector<double>& coeffs, seal::Evaluator& evaluator, seal::CKKSEncoder& encoder,
+                       const seal::RelinKeys& relinKeys, const seal::Ciphertext& x, seal::Ciphertext& dst);
+
+    void evaluate_poly_inplace(const std::vector<double>& coeffs, seal::Evaluator& evaluator, seal::CKKSEncoder& encoder,
+                               const seal::RelinKeys& relinKeys, seal::Ciphertext& x);
 };
 
 

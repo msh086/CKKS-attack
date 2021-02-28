@@ -50,13 +50,24 @@ std::vector<int> modulus_bit_sizes(int total_bit_size, int special_bit_size, int
 }
 
 struct OnExitTimer{
-    chrono::steady_clock::time_point start;
+    chrono::steady_clock::time_point start, last;
     OnExitTimer(){
-        start = chrono::steady_clock::now();
+        last = start = chrono::steady_clock::now();
     }
-    void show(const std::string& str){
+    void show_total_time(const std::string& str) const{
         printf("%s: %f s\n", str.c_str(), chrono::duration_cast<chrono::duration<double>>(
                 chrono::steady_clock::now() - start).count());
+    }
+    void record_current_time() {
+        last = chrono::steady_clock::now();
+    }
+    void show_part_time(const std::string& str) const{
+        printf("%s: %f s\n", str.c_str(), chrono::duration_cast<chrono::duration<double>>(
+                chrono::steady_clock::now() - last).count());
+    }
+    void record_and_show(const std::string& str) {
+        show_part_time(str);
+        record_current_time();
     }
     ~OnExitTimer(){
         printf("time elapsed till program ends: %f s\n", chrono::duration_cast<chrono::duration<double>>(
@@ -67,6 +78,9 @@ struct OnExitTimer{
 int main(int argc, char** argv){
 
     std::string mode;
+    utils::FuncType ftype = utils::F_NONE;
+    size_t taylor_series_degree = 0;
+    std::vector<double> coeffs;
     size_t noise_samp_count = 0;
     size_t logn = 0;
     size_t special_modulus_bit_length = 0;
@@ -95,6 +109,14 @@ int main(int argc, char** argv){
         // output path for complete data
         TCLAP::ValueArg<std::string> complete_data_path_arg("", "complete_data", "path to output complete data.", false, "", "a path string", cmd);
 
+        /// for homomorphic evaluation in atk & def
+        // homo func
+        std::vector<std::string> allowed_funcs{"none", "sigmoid", "exponential"};
+        TCLAP::ValuesConstraint<std::string> func_constraint(allowed_funcs);
+        TCLAP::ValueArg<std::string> func_arg("f", "func", "homomorphic function to evaluate", false, "none", &func_constraint, cmd);
+        // taylor series degree
+        TCLAP::ValueArg<std::size_t> taylor_series_degree_arg("", "deg", "degree for Maclaurin series", false, 0, "a positive integer", cmd);
+
         /// for general purposes
         // modulus polynomial degree
         TCLAP::ValueArg<std::size_t> poly_logn_arg("l", "poly_logn", "log(N) where N is the degree of cyclotomic polynomial", false, 16, "a positive integer, no greater than 16", cmd);
@@ -115,6 +137,23 @@ int main(int argc, char** argv){
         infty_norm_path = infty_norm_path_arg.getValue();
         mean_var_path = mean_var_path_arg.getValue();
         complete_data_path = complete_data_path_arg.getValue();
+        taylor_series_degree = taylor_series_degree_arg.getValue();
+        auto ftype_str = func_arg.getValue();
+        if(ftype_str == "sigmoid")
+            ftype = utils::F_SIGMOID;
+        else if(ftype_str == "exponential")
+            ftype = utils::F_EXPONENT;
+        else if(ftype_str != "none"){
+            printf("unrecognized homo func name: %s\n", ftype_str.c_str());
+            return 1;
+        }
+
+        if(ftype != utils::F_NONE) {
+            coeffs = utils::func_map.at(ftype);
+            if (coeffs.size() - 1 < taylor_series_degree)
+                printf("warning: precomputed series degree %lu < required degree %lu", coeffs.size() - 1,
+                       taylor_series_degree);
+        }
 
         if(mode == "noise" && infty_norm_path.empty() && mean_var_path.empty() && complete_data_path.empty()) {
             printf("no job to do for mode \"noise\"\n");
@@ -131,8 +170,19 @@ int main(int argc, char** argv){
     size_t poly_modulus_degree = 1 << logn; // value of N
     params.set_poly_modulus_degree(poly_modulus_degree);
     // ciphertext modulus q?
-    params.set_coeff_modulus(CoeffModulus::Create(poly_modulus_degree,
-          modulus_bit_sizes(logn == 16 ? 350 : CoeffModulus::MaxBitCount(poly_modulus_degree, sec_level_type::tc256), special_modulus_bit_length, scale_bit_length)));
+    auto modulus_bit_size_vec = modulus_bit_sizes(logn == 16 ? 350 : CoeffModulus::MaxBitCount(
+            poly_modulus_degree, sec_level_type::tc256), special_modulus_bit_length, scale_bit_length);
+    params.set_coeff_modulus(CoeffModulus::Create(poly_modulus_degree, modulus_bit_size_vec));
+    if(ftype != utils::F_NONE) {
+        std::size_t max_homo_levels = modulus_bit_size_vec.size() - 2;
+        std::size_t max_series_degree = (1 << max_homo_levels) - 1;
+        if (coeffs.size() - 1 > max_series_degree) {
+            printf("warning: ciphertext modulus chain of length %lu can only support homomorphic evaluation "
+                   "of degree %lu, less than the required degree %lu\n", modulus_bit_size_vec.size() - 1,
+                   max_series_degree, coeffs.size() - 1);
+            coeffs.resize(max_series_degree + 1);
+        }
+    }
 
     SEALContext context(params, true, sec_level_type::none);
     print_parameters(context);
@@ -158,7 +208,7 @@ int main(int argc, char** argv){
     Plaintext plaintext_polynomial;
     double scale = size_t(1) << scale_bit_length;
 
-    timer.show("init finished");
+    timer.record_and_show("init finished");
 
     if(mode == "noise"){
         auto ctxt = context.first_context_data();
@@ -214,11 +264,11 @@ int main(int argc, char** argv){
             delete inf_norms;
         }
         if(mean){
-            utils::scale_mult(*mean, std::complex<double>(1.0/noise_samp_count));
+            utils::scale_mult_inplace(*mean, std::complex<double>(1.0 / noise_samp_count));
             utils::to_norm(*mean, norm_vector);
             utils::element_wise_mult_inplace(norm_vector, norm_vector);
 
-            utils::scale_mult(*var, 1.0/noise_samp_count);
+            utils::scale_mult_inplace(*var, 1.0 / noise_samp_count);
             utils::element_wise_substract_inplace(*var, norm_vector);
 
             auto mean_var_file = fopen(mean_var_path.c_str(), "w");
@@ -246,8 +296,8 @@ int main(int argc, char** argv){
 /**
  * NOTE on encoding
  *  1.
- *   in ckks.h::encode_internal line 502, plaintext vector is encoded into a vector with DOUBLE coeff using fft
- *   in ckks.h::encode_internal line 527-619, a polynomial before NTT transformation is arranged as:
+ *   in ckks.h::encode_internal line 534, plaintext vector is encoded into a vector with DOUBLE coeff using fft
+ *   in ckks.h::encode_internal line 559-651, a polynomial before NTT transformation is arranged as:
  *   (let d = coeff_modulus_size, n = coeff_count)
  *   [n uint64_t, coeffs modulo first prime] ... [...] (the count of [...] is d)
  *   >> CRT (first CRT layer) memory layout <<
@@ -282,10 +332,10 @@ int main(int argc, char** argv){
  *   the standard variance is the same as CBD, which is 3.2, while the max noise is 6*std_var
  *   gaussian noise is also represented in the CRT domain(first CRT layer) as the CBD noise
  * */
+    sealattack::evaluate_poly_inplace(coeffs, evaluator, encoder, relin_keys, ciphertext);
 
-    evaluator.square_inplace(ciphertext);
-    evaluator.relinearize_inplace(ciphertext, relin_keys);
-    evaluator.rescale_to_next_inplace(ciphertext);
+    std::vector<complex<double>> plain_eval_res;
+    utils::element_wise_eval_polynomial(coeffs, plaintext_vector, plain_eval_res);
 
     Plaintext out_plaintext;
     // NOTE on the output vector: its type must be complex<double> instead of double
@@ -294,7 +344,7 @@ int main(int argc, char** argv){
 
     decryptor.decrypt(ciphertext, out_plaintext);
     encoder.decode(out_plaintext, out_vector);
-    print_vector(out_vector);
+//    print_vector(out_vector);
     if(mode == "defense") {
         const auto &ctxt = *context.get_context_data(out_plaintext.parms_id());
         printf("scale is %e\n", out_plaintext.scale());
@@ -303,10 +353,16 @@ int main(int argc, char** argv){
         std::vector<complex<double>> out_vector_defense;
         encoder.decode(out_plaintext, out_vector_defense);
         print_vector(out_vector_defense);
-        printf("max error is %e\n", utils::max_error(out_vector, out_vector_defense));
-        printf("rel error is %e\n", utils::relative_error(out_vector, out_vector_defense));
+
+        printf("max error in HE evaluation is %e\n", utils::max_error(plain_eval_res, out_vector));
+        printf("rel error in HE evaluation is %e\n", utils::relative_error(plain_eval_res, out_vector));
+
+        printf("max error introduced by noise is %e\n", utils::max_error(out_vector, out_vector_defense));
+        printf("rel error introduced by noise is %e\n", utils::relative_error(out_vector, out_vector_defense));
         out_vector = out_vector_defense;
     }
+    printf("max error in result is %e\n", utils::max_error(plain_eval_res, out_vector));
+    printf("rel error in result is %e\n", utils::relative_error(plain_eval_res, out_vector));
 
     // attack
     printf("start attack\n");
