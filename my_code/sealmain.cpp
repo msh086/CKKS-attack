@@ -3,13 +3,14 @@
 #include <cstring>
 #include <chrono>
 #include <string>
+#include <iostream>
 #include "examples.h"
 #include "sealattack.h"
 #include "utils.h"
 #include "tclap/CmdLine.h"
 
 using namespace seal;
-using namespace std;
+namespace chrono = std::chrono;
 
 void add_gaussian_noise(util::CoeffIter dst, const SEALContext::ContextData &ctxt, double std_dev, double max_dev){
     auto &params = ctxt.parms();
@@ -111,7 +112,7 @@ int main(int argc, char** argv){
 
         /// for homomorphic evaluation in atk & def
         // homo func
-        std::vector<std::string> allowed_funcs{"none", "sigmoid", "exponential"};
+        std::vector<std::string> allowed_funcs{"none", "sigmoid", "exponential", "variance"};
         TCLAP::ValuesConstraint<std::string> func_constraint(allowed_funcs);
         TCLAP::ValueArg<std::string> func_arg("f", "func", "homomorphic function to evaluate", false, "none", &func_constraint, cmd);
         // taylor series degree
@@ -143,12 +144,14 @@ int main(int argc, char** argv){
             ftype = utils::F_SIGMOID;
         else if(ftype_str == "exponential")
             ftype = utils::F_EXPONENT;
+        else if(ftype_str == "variance")
+            ftype = utils::F_VARIANCE;
         else if(ftype_str != "none"){
             printf("unrecognized homo func name: %s\n", ftype_str.c_str());
             return 1;
         }
 
-        if(ftype != utils::F_NONE) {
+        if(utils::need_poly_eval(ftype)) {
             coeffs = utils::func_map.at(ftype);
             if (coeffs.size() - 1 < taylor_series_degree)
                 printf("warning: precomputed series degree %lu < required degree %lu", coeffs.size() - 1,
@@ -173,7 +176,8 @@ int main(int argc, char** argv){
     auto modulus_bit_size_vec = modulus_bit_sizes(logn == 16 ? 350 : CoeffModulus::MaxBitCount(
             poly_modulus_degree, sec_level_type::tc256), special_modulus_bit_length, scale_bit_length);
     params.set_coeff_modulus(CoeffModulus::Create(poly_modulus_degree, modulus_bit_size_vec));
-    if(ftype != utils::F_NONE) {
+
+    if(utils::need_poly_eval(ftype)) {
         std::size_t max_homo_levels = modulus_bit_size_vec.size() - 2;
         std::size_t max_series_degree = (1 << max_homo_levels) - 1;
         if (coeffs.size() - 1 > max_series_degree) {
@@ -186,7 +190,7 @@ int main(int argc, char** argv){
 
     SEALContext context(params, true, sec_level_type::none);
     print_parameters(context);
-    cout << endl;
+    std::cout << std::endl;
 
     KeyGenerator keygen(context);
     auto secret_key = keygen.secret_key();
@@ -204,7 +208,7 @@ int main(int argc, char** argv){
     CKKSEncoder encoder(context);
     size_t slot_count = encoder.slot_count();
 
-    vector<complex<double>> plaintext_vector;
+    std::vector<std::complex<double>> plaintext_vector;
     Plaintext plaintext_polynomial;
     double scale = size_t(1) << scale_bit_length;
 
@@ -265,8 +269,7 @@ int main(int argc, char** argv){
         }
         if(mean){
             utils::scale_mult_inplace(*mean, std::complex<double>(1.0 / noise_samp_count));
-            utils::to_norm(*mean, norm_vector);
-            utils::element_wise_mult_inplace(norm_vector, norm_vector);
+            utils::to_self_inner_product(*mean, norm_vector);
 
             utils::scale_mult_inplace(*var, 1.0 / noise_samp_count);
             utils::element_wise_substract_inplace(*var, norm_vector);
@@ -332,15 +335,26 @@ int main(int argc, char** argv){
  *   the standard variance is the same as CBD, which is 3.2, while the max noise is 6*std_var
  *   gaussian noise is also represented in the CRT domain(first CRT layer) as the CBD noise
  * */
-    sealattack::evaluate_poly_inplace(coeffs, evaluator, encoder, relin_keys, ciphertext);
+    std::vector<std::complex<double>> plain_eval_res;
+    double plain_variance = 0;
+    std::complex<double> plain_mean;
 
-    std::vector<complex<double>> plain_eval_res;
-    utils::element_wise_eval_polynomial(coeffs, plaintext_vector, plain_eval_res);
+    if(ftype != utils::F_VARIANCE) {
+        sealattack::evaluate_poly_inplace(coeffs, evaluator, encoder, relin_keys, ciphertext);
+        utils::element_wise_eval_polynomial(coeffs, plaintext_vector, plain_eval_res);
+    }
+    else {
+        sealattack::calc_variance_inplace(evaluator, encoder, context, rotation_keys, relin_keys, ciphertext);
+//        sealattack::calc_mean_inplace(evaluator, encoder, context, rotation_keys, relin_keys, ciphertext);
+//        utils::calc_mean(plaintext_vector, plain_mean);
+        utils::calc_variance(plaintext_vector, plain_variance);
+    }
+
 
     Plaintext out_plaintext;
     // NOTE on the output vector: its type must be complex<double> instead of double
     //  otherwise an implicit rounding will take place, even the type of input vectors is double
-    std::vector<complex<double>> out_vector;
+    std::vector<std::complex<double>> out_vector;
 
     decryptor.decrypt(ciphertext, out_plaintext);
     encoder.decode(out_plaintext, out_vector);
@@ -350,19 +364,27 @@ int main(int argc, char** argv){
         printf("scale is %e\n", out_plaintext.scale());
         printf("infty norm of plaintext is %e\n", infty_norm_ntt(out_plaintext.data(), ctxt));
         add_gaussian_noise(out_plaintext.data(), ctxt, 3.2, 6 * 3.2);
-        std::vector<complex<double>> out_vector_defense;
+        std::vector<std::complex<double>> out_vector_defense;
         encoder.decode(out_plaintext, out_vector_defense);
         print_vector(out_vector_defense);
 
-        printf("max error in HE evaluation is %e\n", utils::max_error(plain_eval_res, out_vector));
-        printf("rel error in HE evaluation is %e\n", utils::relative_error(plain_eval_res, out_vector));
+        printf("max error in HE evaluation is %e\n", ftype == utils::F_VARIANCE ?
+            utils::max_error_1vN(std::complex<double>(plain_variance), out_vector) :
+            utils::max_error(plain_eval_res, out_vector));
+        printf("rel error in HE evaluation is %e\n", ftype == utils::F_VARIANCE ?
+            utils::max_rel_error_1vN(std::complex<double>(plain_variance), out_vector) :
+            utils::relative_error(plain_eval_res, out_vector));
 
         printf("max error introduced by noise is %e\n", utils::max_error(out_vector, out_vector_defense));
         printf("rel error introduced by noise is %e\n", utils::relative_error(out_vector, out_vector_defense));
         out_vector = out_vector_defense;
     }
-    printf("max error in result is %e\n", utils::max_error(plain_eval_res, out_vector));
-    printf("rel error in result is %e\n", utils::relative_error(plain_eval_res, out_vector));
+    printf("max error in result is %e\n", ftype == utils::F_VARIANCE ?
+        utils::max_error_1vN(std::complex<double>(plain_variance), out_vector) :
+        utils::max_error(plain_eval_res, out_vector));
+    printf("rel error in result is %e\n", ftype == utils::F_VARIANCE ?
+        utils::max_rel_error_1vN(std::complex<double>(plain_variance), out_vector) :
+        utils::relative_error(plain_eval_res, out_vector));
 
     // attack
     printf("start attack\n");

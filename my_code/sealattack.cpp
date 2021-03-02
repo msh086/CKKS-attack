@@ -143,6 +143,9 @@ namespace sealattack {
 
     void evaluate_poly(const std::vector<double>& coeffs, seal::Evaluator& evaluator, seal::CKKSEncoder& encoder,
                        const seal::RelinKeys& relinKeys, const seal::Ciphertext& x, seal::Ciphertext& dst){
+        if(&x == &dst){
+            throw std::invalid_argument("src and dst Ciphertext should not have the same address");
+        }
         int n_coeffs = coeffs.size();
         // trivial cases
         if(n_coeffs == 0) {
@@ -232,5 +235,93 @@ namespace sealattack {
                                const seal::RelinKeys& relinKeys, seal::Ciphertext& x){
         seal::Ciphertext copy = x;
         evaluate_poly(coeffs, evaluator, encoder, relinKeys, copy, x);
+    }
+
+    void calc_variance(seal::Evaluator& evaluator, seal::CKKSEncoder& encoder, const seal::SEALContext& ctxt,
+                       const seal::GaloisKeys& galoisKeys, const seal::RelinKeys& relinKeys,
+                       const seal::Ciphertext& src, seal::Ciphertext& dst, const seal::Ciphertext *mean){
+        if(&src == &dst || mean == &dst)
+            throw std::invalid_argument("dst cannot have the same address as src or mean");
+        seal::Ciphertext tmp_ciphertext;
+        evaluator.complex_conjugate(src, galoisKeys, tmp_ciphertext);
+        evaluator.multiply_inplace(tmp_ciphertext, src);
+        evaluator.relinearize_inplace(tmp_ciphertext, relinKeys);
+        evaluator.rescale_to_next_inplace(tmp_ciphertext);
+        // compute mean(x^2)
+        calc_mean(evaluator, encoder, ctxt, galoisKeys, relinKeys, tmp_ciphertext, dst);
+        // compute mean(x)^2
+        if(mean)
+            tmp_ciphertext = *mean;
+        else
+            calc_mean(evaluator, encoder, ctxt, galoisKeys, relinKeys, src, tmp_ciphertext);
+        seal::Ciphertext tmp_ciphertext_2;
+        evaluator.complex_conjugate(tmp_ciphertext, galoisKeys, tmp_ciphertext_2);
+        evaluator.multiply_inplace(tmp_ciphertext, tmp_ciphertext_2);
+        evaluator.relinearize_inplace(tmp_ciphertext, relinKeys);
+        evaluator.rescale_to_next_inplace(tmp_ciphertext);
+        // compute var(x) = mean(x^2) - mean(x)^2
+        scale_to_same_level(evaluator, encoder, ctxt, relinKeys, dst, tmp_ciphertext);
+        evaluator.sub_inplace(dst, tmp_ciphertext);
+    }
+
+    void calc_variance_inplace(seal::Evaluator& evaluator, seal::CKKSEncoder& encoder, const seal::SEALContext& ctxt,
+                               const seal::GaloisKeys& galoisKeys, const seal::RelinKeys& relinKeys,
+                               seal::Ciphertext& src, const seal::Ciphertext *mean){
+        seal::Ciphertext src_copy = src;
+        calc_variance(evaluator, encoder, ctxt, galoisKeys, relinKeys, src_copy, src, mean);
+    }
+
+    void calc_mean(seal::Evaluator& evaluator, seal::CKKSEncoder& encoder, const seal::SEALContext& ctxt,
+                   const seal::GaloisKeys& galoisKeys, const seal::RelinKeys& relinKeys,
+                   const seal::Ciphertext& src, seal::Ciphertext& dst){
+        if(&src == &dst)
+            throw std::invalid_argument("src and dst should not have the same address");
+        dst = src;
+        // n_slot is guaranteed to be power of 2
+        int n_slot = ctxt.get_context_data(src.parms_id())->parms().poly_modulus_degree() >> 1;
+        int n_slot_copy = n_slot;
+        int step = 1;
+        seal::Ciphertext rotated_tmp;
+        while(n_slot_copy>>=1){
+            evaluator.rotate_vector(dst, step, galoisKeys, rotated_tmp);
+            evaluator.add_inplace(dst, rotated_tmp);
+            step <<= 1;
+        }
+        seal::Plaintext plain_tmp;
+        encoder.encode(1. / n_slot, dst.parms_id(), dst.scale(), plain_tmp);
+        evaluator.multiply_plain_inplace(dst, plain_tmp);
+        evaluator.relinearize_inplace(dst, relinKeys);
+        evaluator.rescale_to_next_inplace(dst);
+    }
+
+    void calc_mean_inplace(seal::Evaluator& evaluator, seal::CKKSEncoder& encoder, const seal::SEALContext& ctxt,
+                   const seal::GaloisKeys& galoisKeys, const seal::RelinKeys& relinKeys,
+                   seal::Ciphertext& src){
+        seal::Ciphertext src_copy = src;
+        calc_mean(evaluator, encoder, ctxt, galoisKeys, relinKeys, src_copy, src);
+    }
+
+    void scale_to_same_level(seal::Evaluator& evaluator, seal::CKKSEncoder& encoder, const seal::SEALContext& ctxt,
+                             const seal::RelinKeys& relinKeys, seal::Ciphertext& c1, seal::Ciphertext& c2){
+        auto remain1 = ctxt.get_context_data(c1.parms_id())->parms().coeff_modulus().size(),
+            remain2 = ctxt.get_context_data(c2.parms_id())->parms().coeff_modulus().size();
+        seal::Ciphertext* higher = nullptr;
+        std::size_t diff = 0;
+        if(remain1 < remain2){
+            diff = remain2 - remain1;
+            higher = &c2;
+        }
+        else{
+            diff = remain2 - remain1;
+            higher = &c1;
+        }
+        seal::Plaintext tmp_plain;
+        while(diff){ // using `diff--` here may lead to underflow
+            encoder.encode(1, higher->parms_id(), higher->scale(), tmp_plain);
+            evaluator.multiply_plain_inplace(*higher, tmp_plain);
+            evaluator.relinearize_inplace(*higher, relinKeys);
+            evaluator.rescale_to_next_inplace(*higher);
+            diff--;
+        }
     }
 }

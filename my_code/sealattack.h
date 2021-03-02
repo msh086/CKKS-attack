@@ -58,6 +58,25 @@ namespace sealattack {
 
     void evaluate_poly_inplace(const std::vector<double>& coeffs, seal::Evaluator& evaluator, seal::CKKSEncoder& encoder,
                                const seal::RelinKeys& relinKeys, seal::Ciphertext& x);
+
+    void calc_mean(seal::Evaluator& evaluator, seal::CKKSEncoder& encoder, const seal::SEALContext& ctxt,
+                   const seal::GaloisKeys& galoisKeys, const seal::RelinKeys& relinKeys,
+                   const seal::Ciphertext& src, seal::Ciphertext& dst);
+
+    void calc_mean_inplace(seal::Evaluator& evaluator, seal::CKKSEncoder& encoder, const seal::SEALContext& ctxt,
+                           const seal::GaloisKeys& galoisKeys, const seal::RelinKeys& relinKeys,
+                           seal::Ciphertext& src);
+
+    void calc_variance(seal::Evaluator& evaluator, seal::CKKSEncoder& encoder, const seal::SEALContext& ctxt,
+                       const seal::GaloisKeys& galoisKeys, const seal::RelinKeys& relinKeys,
+                       const seal::Ciphertext& src, seal::Ciphertext& dst, const seal::Ciphertext *mean = nullptr);
+
+    void calc_variance_inplace(seal::Evaluator& evaluator, seal::CKKSEncoder& encoder, const seal::SEALContext& ctxt,
+                               const seal::GaloisKeys& galoisKeys, const seal::RelinKeys& relinKeys,
+                               seal::Ciphertext& src, const seal::Ciphertext *mean = nullptr);
+
+    void scale_to_same_level(seal::Evaluator& evaluator, seal::CKKSEncoder& encoder, const seal::SEALContext& ctxt,
+                             const seal::RelinKeys& relinKeys, seal::Ciphertext& c1, seal::Ciphertext& c2);
 };
 
 

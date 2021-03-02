@@ -36,6 +36,7 @@ namespace utils {
     }
 
     const std::map<FuncType, std::vector<double>> func_map = {
+            {FuncType::F_NONE, {}},
             {FuncType::F_SIGMOID, {1./2, 1./4, 0, -1./48, 0, 1./480, 0, -17./80640, 0, 31./1451520, 0}},
             {FuncType::F_EXPONENT, {1, 1, 1./2, 1./6, 1./24, 1./120, 1./720, 1./5040, 1./40320, 1./362880, 1./3628800}}
     };
