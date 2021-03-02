@@ -143,9 +143,6 @@ namespace sealattack {
 
     void evaluate_poly(const std::vector<double>& coeffs, seal::Evaluator& evaluator, seal::CKKSEncoder& encoder,
                        const seal::RelinKeys& relinKeys, const seal::Ciphertext& x, seal::Ciphertext& dst){
-        if(&x == &dst){
-            throw std::invalid_argument("src and dst Ciphertext should not have the same address");
-        }
         int n_coeffs = coeffs.size();
         // trivial cases
         if(n_coeffs == 0) {
@@ -233,8 +230,8 @@ namespace sealattack {
 
     void evaluate_poly_inplace(const std::vector<double>& coeffs, seal::Evaluator& evaluator, seal::CKKSEncoder& encoder,
                                const seal::RelinKeys& relinKeys, seal::Ciphertext& x){
-        seal::Ciphertext copy = x;
-        evaluate_poly(coeffs, evaluator, encoder, relinKeys, copy, x);
+//        seal::Ciphertext copy = x;
+        evaluate_poly(coeffs, evaluator, encoder, relinKeys, x, x);
     }
 
     void calc_variance(seal::Evaluator& evaluator, seal::CKKSEncoder& encoder, const seal::SEALContext& ctxt,
@@ -249,6 +246,8 @@ namespace sealattack {
         evaluator.rescale_to_next_inplace(tmp_ciphertext);
         // compute mean(x^2)
         calc_mean(evaluator, encoder, ctxt, galoisKeys, relinKeys, tmp_ciphertext, dst);
+        // value of dst changes here, if dst is the same object as src(or mean), from now on src(or mean) should not
+        // be used anymore. However they are still used, so address check is performed at the beginning
         // compute mean(x)^2
         if(mean)
             tmp_ciphertext = *mean;
@@ -274,8 +273,6 @@ namespace sealattack {
     void calc_mean(seal::Evaluator& evaluator, seal::CKKSEncoder& encoder, const seal::SEALContext& ctxt,
                    const seal::GaloisKeys& galoisKeys, const seal::RelinKeys& relinKeys,
                    const seal::Ciphertext& src, seal::Ciphertext& dst){
-        if(&src == &dst)
-            throw std::invalid_argument("src and dst should not have the same address");
         dst = src;
         // n_slot is guaranteed to be power of 2
         int n_slot = ctxt.get_context_data(src.parms_id())->parms().poly_modulus_degree() >> 1;
@@ -297,8 +294,7 @@ namespace sealattack {
     void calc_mean_inplace(seal::Evaluator& evaluator, seal::CKKSEncoder& encoder, const seal::SEALContext& ctxt,
                    const seal::GaloisKeys& galoisKeys, const seal::RelinKeys& relinKeys,
                    seal::Ciphertext& src){
-        seal::Ciphertext src_copy = src;
-        calc_mean(evaluator, encoder, ctxt, galoisKeys, relinKeys, src_copy, src);
+        calc_mean(evaluator, encoder, ctxt, galoisKeys, relinKeys, src, src);
     }
 
     void scale_to_same_level(seal::Evaluator& evaluator, seal::CKKSEncoder& encoder, const seal::SEALContext& ctxt,
