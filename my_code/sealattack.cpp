@@ -171,7 +171,7 @@ namespace sealattack {
         dst = x;
         encoder.encode(coeffs[1], dst.parms_id(), dst.scale(), tmp_plaintext);
         evaluator.multiply_plain_inplace(dst, tmp_plaintext);
-        evaluator.relinearize_inplace(dst, relinKeys);
+//        evaluator.relinearize_inplace(dst, relinKeys);
         evaluator.rescale_to_next_inplace(dst);
         // now dst = c1 * x
         encoder.encode(coeffs[0], dst.parms_id(), dst.scale(), tmp_plaintext);
@@ -200,7 +200,7 @@ namespace sealattack {
             tmp_ciphertext = tower[cursor_bit_idx];
             encoder.encode(coeffs[cur_deg], tmp_ciphertext.parms_id(), tmp_ciphertext.scale(), tmp_plaintext);
             evaluator.multiply_plain_inplace(tmp_ciphertext, tmp_plaintext);
-            evaluator.relinearize_inplace(tmp_ciphertext, relinKeys);
+//            evaluator.relinearize_inplace(tmp_ciphertext, relinKeys);
             evaluator.rescale_to_next_inplace(tmp_ciphertext);
             while(++cursor_bit_idx < cur_deg_total_bits){
                 if((1 << cursor_bit_idx) & cur_deg){
@@ -210,7 +210,7 @@ namespace sealattack {
                 }
                 else{
                     evaluator.multiply_plain_inplace(tmp_ciphertext, plaintexts_all_ones[cursor_bit_idx]);
-                    evaluator.relinearize_inplace(tmp_ciphertext, relinKeys);
+//                    evaluator.relinearize_inplace(tmp_ciphertext, relinKeys);
                     evaluator.rescale_to_next_inplace(tmp_ciphertext);
                 }
             }
@@ -219,7 +219,7 @@ namespace sealattack {
             // the level of dst need to be recorded to perform rescaling
             while(dst.parms_id() != tmp_ciphertext.parms_id()) {
                 evaluator.multiply_plain_inplace(dst, plaintexts_all_ones[ciphertext_level++]);
-                evaluator.relinearize_inplace(dst, relinKeys);
+//                evaluator.relinearize_inplace(dst, relinKeys);
                 evaluator.rescale_to_next_inplace(dst);
             }
             evaluator.add_inplace(dst, tmp_ciphertext);
@@ -287,7 +287,7 @@ namespace sealattack {
         seal::Plaintext plain_tmp;
         encoder.encode(1. / n_slot, dst.parms_id(), dst.scale(), plain_tmp);
         evaluator.multiply_plain_inplace(dst, plain_tmp);
-        evaluator.relinearize_inplace(dst, relinKeys);
+//        evaluator.relinearize_inplace(dst, relinKeys);
         evaluator.rescale_to_next_inplace(dst);
     }
 
@@ -315,7 +315,7 @@ namespace sealattack {
         while(diff){ // using `diff--` here may lead to underflow
             encoder.encode(1, higher->parms_id(), higher->scale(), tmp_plain);
             evaluator.multiply_plain_inplace(*higher, tmp_plain);
-            evaluator.relinearize_inplace(*higher, relinKeys);
+//            evaluator.relinearize_inplace(*higher, relinKeys);
             evaluator.rescale_to_next_inplace(*higher);
             diff--;
         }
