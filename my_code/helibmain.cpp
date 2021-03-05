@@ -1,10 +1,17 @@
 //
 // Created by msh on 2021/1/27.
+// NOTE: 2021/3/4
+//  the attack on HElib doesn't work for this version (v2.0.0)
+//  the scaling factor will grow so large, so that casting plaintext polynomial coefficients
+//  into double data type will result in rounding error > 0.5
+//  such type conversion is necessary for encoding / decoding
 //
 #include <iostream>
 #include <vector>
 #include <helib/helib.h>
 #include <NTL/ZZ_pE.h>
+#include "helibattack.h"
+#include "utils.h"
 
 using namespace std;
 using namespace helib;
@@ -44,10 +51,11 @@ void CKKS_decode(const NTL::ZZX& pp,
 }
 
 int main(int argc, char** argv){
+    helibattack::print_NTL_macros();
 
     Context context = ContextBuilder<CKKS>()
             .m(1 << 17) // n = 2^16
-            .bits(1098) // settings for bits and c0 follow recommendation in CKKS tutorial
+            .bits(300) // settings for bits and c0 follow recommendation in CKKS tutorial
             .c(2)
             .precision(20)
             .build();
@@ -64,13 +72,12 @@ int main(int argc, char** argv){
     //  to avoid such situation, omit & to use copy construction
     const PubKey& publibKey = secretKey;
 
-    vector<double> vec(n);
-    for(size_t i = 0;i < n ;i++)
-        vec[i] = sin(2 * PI * i / n);
+    vector<cx_double> vec(n);
+    utils::sample_complex_circle(vec, n, 1);
 
     /**
      * plaintext is not encoded in PtxtArray
-     * it simply holds a the unencoded vector
+     * it simply holds the unencoded vector
      * */
     PtxtArray ptxt0(context, vec);
     Ctxt c0(publibKey);
@@ -99,10 +106,22 @@ int main(int argc, char** argv){
      *     so we can get a high probability bound on the L-infty norm of decoded noise (slot error)
      *  4. choose a scaling factor s.t. the error on each slot is not more than 2^(-precision)
      *   i.e. slot_err / scale <= 2^(-precision)
-     * NOTE: in current implementation, slot_err = 10 * sqrt(N/12)
+     * NOTE: in current implementation, slot_err = 10 * sqrt(N/12), i.e. scale = 10, -log2(erfc(10/sqrt(2)) = 75.8
      *  let N = 2^k
      *  scale = 2^ceil(log_2(2^precision * slot_err)) = 2^ceil(precision + k/2 + log_2(5/sqrt(3)))
      *  where log_2(5/sqrt(3)) is approximately 1.5
+     *
+     * Encryption calling sequence depends on whether the PublicKey instance is actually a SecKey instance
+     * in the case of true, keys.cpp line 1620 SecKey::Encrypt is called:
+     *  a NEW RLWE instance is generated, playing the role of r <- ZO(0.5), e' <- GD(3.2), r * pk + e'
+     * otherwise, keys.cpp line 756 PubKey::Encrypt is called:
+     *  r <- ZO(0.5), e' <- GD(3.2), r * pk + e'
+     * then in both functions, the error in the RLWE instance is estimated as 'err_bound'
+     * while the encoding error is called 'err'
+     * like that in homomorphic multiplication, HElib wants the precision loss in encryption is not more than 1 bit
+     * i.e err_bound is no greater than err
+     * so an extra scaling factor 'ef' is defined as ceil(err_bound / err)
+     * then the plaintext polynomial is scaled up by ef, s.t. encryption noise is smaller than encoding noise
      * */
     ptxt0.encrypt(c0);
 
@@ -111,8 +130,42 @@ int main(int argc, char** argv){
     Ctxt c1(publibKey);
     ptxt1.encrypt(c1);
 
+    c1 *= c0;
+    c1.dropSmallAndSpecialPrimes();
+
+    helibattack::print_xdouble(c1.getRatFactor());
+    /**
+     * >> An attempt to analyze weird scaling up/down behaviour <<
+     * in Ctxt.cpp::modSwitchAddedNoiseBound line 2535, this function calculates B_scale:
+     *  c = (b, a) -->rescaling down by q--> c' = (round(b/q), round(a/q))
+     *  e_scale = <c', sk> - <c, sk> / q = (b/q - round(b/q)) + (a/q - round(a/q)) * s
+     *  here, we assume the rounding errors (b/q - round(b/q)) and (a/q - round(a/q))
+     *  both follow a uniform distribution on [-0.5, 0.5]
+     *  we note those rounding errors as random variable r_1, r_2 ~ U(-0.5, 0.5)
+     *  according to inequalities on canonical norm, the infinite norm of plaintext error is
+     *  B_scale = B(r_1 + r_2 * s) <= B(r_1) + B(r_2) * B(s) = (1 + B(s)) * noiseBoundUniform(0.5)
+     *  // we are familiar with noiseBoundUniform, it returns a high-probability bound
+     *  // on plaintext error, according to erfc and central limit theorem
+     *
+     * in Ctxt.cpp::computeIntervalForMul line 1589, look at document 5.3.2 for detailed explanation
+     *  after rescaling from modulus q_i to q, the error bound will be q/q_i * B + B_scale
+     *  to prevent error bound from growing too fast, HElib wants rescaled error (q/q_i * B) to
+     *  be no greater than rounding error (B_scale), in this way the precision loss is only 1 bit per rescaling
+     *  HElib decides q according to the rule above, so we have:
+     *      log(q) \approx target = log(B_scale) + log(q_i) - log(B)
+     *  what this function do is exactly calculating such log(q)
+     *  Extra note: the document says HElib searches log(q) in [target - 4, target - 1]
+     *  this is the case for BGV but not for CKKS; in the case of CKKS, the range is [target + 1, target + 4]
+     *
+     * in Ctxt.cpp::reLinearize line 706:
+     *  first all small primes and special primes are dropped, this may affect ratFactor
+     *  the special primes are added to prime set, causing the ratFactor to expand by the same ratio
+     *  the special primes are NOT dropped after relinearization
+     * */
+
     Ctxt c2 = c0;
-    c2 += c1;
+    helibattack::eval_polynomial_inplace(utils::func_map.at(utils::F_EXPONENT), c2);
+    utils::element_wise_eval_polynomial_inplace(utils::func_map.at(utils::F_EXPONENT), vec);
 
     PtxtArray out(context);
     /**
@@ -124,7 +177,25 @@ int main(int argc, char** argv){
      * in Ctxt.cpp::addedNoiseForCKKSDecryption, sigma is the standard deviation of each polynomial coefficient
      * sampleGaussianBoundedEffectiveBound returns a bound factor B s.t. the decoded vector is bounded by B*sigma
      * this function returns sqrt(N*ln(N))
-     * TODO: to be honest I don't understand its logic, but I guess sqrt(ln(N)) plays the role of scale in erfc?
+     * FIXME complex gaussian tail bound probability needs proof
+     * NOTE: see documentation 2.6.1
+     *  each element of the decoded vector satisfies a complex gaussian distribution of variance sigma^2
+     *  let such random variable be x
+     *  then P(|x| > B) = exp(-B^2/sigma^2) /// need proof!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+     *  let B = sigma * sqrt(log(n)), then P(|x| > B) = 1/n
+     *  the heading half of the decoded vector is conjugate with the tailing half
+     *  so we only need to consider n/2 elements
+     *  the probability that the whole n/2-lengthed vector exceeds bound B is no greater than
+     *  P(|x| > B) * n/2 = 1/2
+     *  which means it's likely that the loop:
+     *      sample a <- R_q
+     *      decode v <- Dcd(a)
+     *      test infty_norm(v) > B ?
+     *          true -> go back
+     *          false -> return
+     *  can find a wanted a in no too much loops
+     *  P.S. the limit on max loops is 1000, which means a runtime error caused by bounded gaussian sample failure
+     *  is no more than 2^-1000
      *
      * here we need to decrypt without adding additional noise to perform attack
      * following code is similar to those in EaCx.cpp::EncryptedArray<PA_cx>::decrypt line 88
@@ -139,8 +210,11 @@ int main(int argc, char** argv){
     auto palgebra = context.getAlMod().getZMStar();
     CKKS_decode(pp, factor, palgebra, vec_out);
 
-    cout << "max bit length: " << NTL::NumBits(largestCoeff(pp)) << endl;
+    cout << "max poly coeff bit length: " << NTL::NumBits(largestCoeff(pp)) << endl;
     cout << "scaling bits: " << NTL::NumBits(NTL::conv<NTL::ZZ>(factor)) << endl;
+
+    cout << "max error: " << utils::max_error(vec, vec_out) << endl;
+    cout << "rel error: " << utils::relative_error(vec, vec_out) << endl;
 
     out.load(vec_out);
     // re-encode
