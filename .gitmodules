@@ -7,3 +7,6 @@
 [submodule "SEAL"]
 	path = SEAL
 	url = ../SEAL
+[submodule "lattigo"]
+	path = lattigo
+	url = ../lattigo
