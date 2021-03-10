@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"github.com/ldsec/lattigo/v2/ckks"
 	"math"
@@ -8,20 +9,66 @@ import (
 	"time"
 )
 
+var modeFlag string
+var lognFlag uint64
+var scaleFlag float64
+var logScaleFlag uint64
+
+func init() {
+	flag.StringVar(&modeFlag, "mode", "attack", "mode to run, available options: attack|defense")
+	flag.Uint64Var(&lognFlag, "logn", 16, "log2(N), N is the ring dimension")
+	flag.Float64Var(&scaleFlag, "scale", 1 << 40, "scale for encoding")
+	flag.Uint64Var(&logScaleFlag, "logscale", 0, "log2(scale), has higher priority than '-scale'")
+}
+
+func printFLags() {
+	fmt.Printf("mode = %s, logn = %d, scale = %d, log scale = %d", modeFlag, lognFlag, scaleFlag, logScaleFlag)
+}
+
+func checkFlags() {
+	if modeFlag != "attack" && modeFlag != "defense" {
+		panic(fmt.Sprintf("unknown mode %s", modeFlag))
+	}
+	if lognFlag <= 1 {
+		panic(fmt.Sprintf("%d is too small for logn", lognFlag))
+	}
+	if lognFlag > 16 {
+		panic(fmt.Sprintf("%d is too large for logn", lognFlag))
+	}
+	if logScaleFlag != 0 {
+		scaleFlag = float64(uint64(1) << logScaleFlag)
+	}
+}
+
+func infNorm(arr []complex128) float64 {
+	var max float64 = 0
+	for _, ele := range arr {
+		im, re := imag(ele), real(ele)
+		sqrL2 := im * im + re * re
+		if max < sqrL2 {
+			max = sqrL2
+		}
+	}
+	return math.Sqrt(max)
+}
+
 func example() {
+	flag.Parse()
+
+	printFLags()
 
 	var start time.Time
 	var err error
 
-	LogN := uint64(14)
-	LogSlots := uint64(13)
+	LogN := lognFlag //uint64(16)
+	LogSlots := lognFlag - 1 //uint64(15)
 
 	LogModuli := ckks.LogModuli{
 		LogQi: []uint64{55, 40, 40, 40, 40, 40, 40, 40},
 		LogPi: []uint64{45, 45},
 	}
 
-	Scale := float64(1 << 40)
+	Scale := scaleFlag //float64(1 << 40)
 
 	params, err := ckks.NewParametersFromLogModuli(LogN, &LogModuli)
 	if err != nil {
@@ -241,22 +288,37 @@ func example() {
 	start = time.Now()
 
 	outPlain := decryptor.DecryptNew(ciphertext)
-	outvalues := encoder.Decode(outPlain, params.LogSlots())
+	outValues := encoder.Decode(outPlain, params.LogSlots())
 
 	fmt.Printf("Done in %s \n", time.Since(start))
 
+	fmt.Println("this is the precision stats between expected & actual values")
 	printDebug(params, ciphertext, values, decryptor, encoder)
 
 	// now attack
 	fmt.Println("log2(scale) = ", math.Log2(ciphertext.Scale()))
-	fmt.Println("log2(inf norm) = ", )
+	fmt.Println("log2(inf norm) = ", infNorm(outValues))
 	ptxt1 := ckks.NewPlaintext(params, ciphertext.Level(), ciphertext.Scale())
 	ptxt2 := ckks.NewPlaintext(params, ciphertext.Level(), ciphertext.Scale())
 
-	encoder.EncodeNTT(ptxt1, outvalues, params.LogSlots())
+	if modeFlag == "defense" {
+		fmt.Println("adding extra error for defense...")
+
+		expEnc := ckks.CastExposedEncryptor(encryptor)
+		expEnc.AddGaussianNoise(outPlain.El())
+
+		noisy := encoder.Decode(outPlain, params.LogSlots())
+		fmt.Println("this is the precision stats between actual & noisy values")
+		printDebugBrief(params, outValues, noisy)
+		fmt.Println("this is the precision stats between expected & noisy values")
+		printDebugBrief(params, values, noisy)
+		outValues = noisy
+	}
+
+	encoder.EncodeNTT(ptxt1, outValues, params.LogSlots())
 	fmt.Println("re-encoding ok? ", ckks.IsSame(ptxt1.El(), outPlain.El()))
 	// now ptxt1 = m+e
-	exposed := ckks.CastExposed(evaluator)
+	exposed := ckks.CastExposedEvaluator(evaluator)
 	cipherB := ckks.GetCiphertextPartAsElement(ciphertext, 0)
 	exposed.SubPlain(ptxt1.El(), cipherB, ptxt1.El())
 	// now ptxt1 = m+e-b
@@ -271,6 +333,13 @@ func example() {
 	exposed.MFormElement(ptxt1.El(), ptxt1.El())
 	skEle := ckks.GetSeckeyAsElement(sk)
 	fmt.Println("recovery Ok? ", ckks.IsSame(ptxt1.El(), skEle))
+}
+
+func printDebugBrief(params *ckks.Parameters, valuesWant []complex128, valuesTest []complex128) {
+
+	precStats := ckks.GetPrecisionStats(params, nil, nil, valuesWant, valuesTest)
+
+	fmt.Println(precStats.String())
 }
 
 func printDebug(params *ckks.Parameters, ciphertext *ckks.Ciphertext, valuesWant []complex128, decryptor ckks.Decryptor, encoder ckks.Encoder) (valuesTest []complex128) {
