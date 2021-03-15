@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"github.com/ldsec/lattigo/v2/ckks"
 	"math"
+	"math/bits"
 	"math/cmplx"
+	"math/rand"
 	"time"
 )
 
@@ -13,12 +15,41 @@ var modeFlag string
 var lognFlag uint64
 var scaleFlag float64
 var logScaleFlag uint64
+var funcTypeFlag string
+
+var maclaurinSeries = map[string][]complex128{
+	"exponent": {
+		complex(1.0, 0),
+		complex(1.0, 0),
+		complex(1.0/2, 0),
+		complex(1.0/6, 0),
+		complex(1.0/24, 0),
+		complex(1.0/120, 0),
+		complex(1.0/720, 0),
+		complex(1.0/5040, 0),
+		complex(1.0/40320, 0)},
+		//1./2, 1./4, 0, -1./48, 0, 1./480, 0, -17./80640, 0, 31./1451520, 0
+	"sigmoid": {
+		complex(1.0/2, 0),
+		complex(1.0/4, 0),
+		complex(0, 0),
+		complex(-1.0/48, 0),
+		complex(0, 0),
+		complex(1.0/480, 0),
+		complex(0, 0),
+		complex(-17.0/80640, 0),
+		complex(0, 0),
+		complex(31.0/1451520, 0),
+	},
+}
 
 func init() {
 	flag.StringVar(&modeFlag, "mode", "attack", "mode to run, available options: attack|defense")
 	flag.Uint64Var(&lognFlag, "logn", 16, "log2(N), N is the ring dimension")
 	flag.Float64Var(&scaleFlag, "scale", 1 << 40, "scale for encoding")
-	flag.Uint64Var(&logScaleFlag, "logscale", 0, "log2(scale), has higher priority than '-scale'")
+	flag.Uint64Var(&logScaleFlag, "logscale", 0, "log2(scale), has higher priority than '-scale', " +
+		"when set to 0, the value of '-scale' will be used instead")
+	flag.StringVar(&funcTypeFlag, "func", "", "function to be evaluated. {exponent, sigmoid, variance}")
 }
 
 func printFLags() {
@@ -52,10 +83,104 @@ func infNorm(arr []complex128) float64 {
 	return math.Sqrt(max)
 }
 
+func homoMean(ciphertext *ckks.Ciphertext, evaluator ckks.Evaluator, rotk *ckks.RotationKeys) *ckks.Ciphertext {
+	ctxtCopy := ciphertext.CopyNew().Ciphertext()
+	tmp := ciphertext.CopyNew().Ciphertext()
+	logn := bits.Len(uint(len(ctxtCopy.Value()[0].Coeffs[0]))) - 1
+	for step := uint64(1); logn > 0; logn, step = logn - 1, step << 1  {
+		evaluator.Rotate(ctxtCopy, step, rotk, tmp)
+		evaluator.Add(ctxtCopy, tmp, ctxtCopy)
+	}
+	// NOTE: passing 1.0/len(...) will get an int of value 0 !!!
+	evaluator.MultByConst(ctxtCopy, 1.0/float64(len(ciphertext.Value()[0].Coeffs[0])), ctxtCopy)
+	evaluator.RescaleMany(ctxtCopy, 1, ctxtCopy)
+	return ctxtCopy
+}
+
+func homoVar(ciphertext *ckks.Ciphertext, evaluator ckks.Evaluator,
+		evk *ckks.EvaluationKey, rotk *ckks.RotationKeys) *ckks.Ciphertext {
+	ctxtCopy := evaluator.ConjugateNew(ciphertext, rotk)
+	evaluator.MulRelin(ciphertext, ctxtCopy, evk, ctxtCopy)
+	if err := evaluator.RescaleMany(ctxtCopy, 1, ctxtCopy); err != nil {
+		panic(err)
+	}
+	meanSquare := homoMean(ctxtCopy, evaluator, rotk) // E(|x|^2)
+	mean := homoMean(ciphertext, evaluator, rotk)
+	evaluator.Conjugate(mean, rotk, ctxtCopy)
+	evaluator.MulRelin(mean, ctxtCopy, evk, mean) // |E(x)|^2
+	if err := evaluator.RescaleMany(mean, 1, mean); err != nil {
+		panic(err)
+	}
+	evaluator.Sub(meanSquare, mean, meanSquare)
+	return meanSquare
+}
+
+func sampleUnitCircle() complex128 {
+	cdfSamp := float64(rand.Uint64()) / math.MaxUint64
+	rSamp := math.Sqrt(cdfSamp)
+	rhoSamp := float64(rand.Uint64()) / math.MaxUint64 * 2 * math.Pi
+	return cmplx.Rect(rSamp, rhoSamp)
+}
+
+func evalPointPoly(val complex128, coeffs []complex128) (res complex128) {
+	res = coeffs[0]
+	pow := val
+	for _, coeff := range coeffs[1:] {
+		res += pow * coeff
+		pow *= val
+	}
+	return
+}
+
+func evalVecPoly(vec []complex128, coeffs []complex128) {
+	for idx := range vec {
+		vec[idx] = evalPointPoly(vec[idx], coeffs)
+	}
+}
+
+func evalVecVar(vec []complex128) (Var float64) {
+	var mean complex128 = 0
+	Var = 0
+	for _, val := range vec {
+		mean += val
+		Var += imag(val) * imag(val) + real(val) * real(val)
+	}
+	mean /= complex(float64(len(vec)), 0) // E(x)
+	Var /= float64(len(vec)) // E(|x|^2)
+	Var -= imag(mean) * imag(mean) + real(mean) * real(mean) // E(|x|^2) - |E(x)|^2
+	return
+}
+
+//func evalPolySimple(src *ckks.Ciphertext, dst *ckks.Ciphertext, coeffs []complex128,
+//		evaluator ckks.Evaluator, encoder ckks.Encoder, relinKey *ckks.EvaluationKey, parameters *ckks.Parameters) {
+//	polyDeg := len(coeffs)
+//	bitsLen := bits.Len64(uint64(polyDeg))
+//	powerOf2s := make([]*ckks.Ciphertext, bitsLen)
+//	powerOf2s[0] = src
+//	for i := 1; i < bitsLen; i++ {
+//		powerOf2s[i] = evaluator.MulRelinNew(powerOf2s[i - 1], powerOf2s[i - 1], relinKey)
+//		evaluator.Rescale()
+//	}
+//	dst = ckks.NewCiphertext(parameters, src.Degree(), src.Level(), src.Scale())
+//	dst.Copy(src.El())
+//	tmp := ckks.NewPlaintext(parameters, src.Level(), src.Scale())
+//	valueVec := make([]complex128, 1 << parameters.LogSlots())
+//	setVec := func (val complex128) {
+//		for idx := range valueVec {
+//			valueVec[idx] = val
+//		}
+//	}
+//	setVec(coeffs[1])
+//	encoder.Encode(tmp, valueVec, parameters.LogSlots())
+//	evaluator.MulRelin(dst, tmp, relinKey)
+//}
+
 func example() {
 	flag.Parse()
 
 	printFLags()
+
+	checkFlags()
 
 	var start time.Time
 	var err error
@@ -70,6 +195,13 @@ func example() {
 
 	Scale := scaleFlag //float64(1 << 40)
 
+	// Note:
+	//  although NTT only requires that q mod n = 1, but here primes are chosen s.t. q mod 2n = 1
+	//  shijie provides a possible explanation for this:
+	//	 the ring R is Z[x]/(x^n+1), but we expand to Z[x]/(x^2n-1) and calculate NTT there
+	//	 since x^2n-1 is the typical form for 'primitive roots of unity', while x^n+1 is not
+	//
+	//  ref to ring.go line 117 genNTTParams
 	params, err := ckks.NewParametersFromLogModuli(LogN, &LogModuli)
 	if err != nil {
 		panic(err)
@@ -117,6 +249,9 @@ func example() {
 
 	rlk := kgen.GenRelinKey(sk)
 
+	rotk := kgen.GenRotationKeysPow2(sk)
+	kgen.GenRotationKey(ckks.Conjugate, sk, 1, rotk)
+
 	encryptor := ckks.NewEncryptorFromSk(params, sk)
 
 	decryptor := ckks.NewDecryptor(params, sk)
@@ -138,22 +273,21 @@ func example() {
 
 	start = time.Now()
 
-	r := float64(16)
-
-	pi := 3.141592653589793
+	//r := float64(16)
+	//pi := 3.141592653589793
 
 	slots := params.Slots()
 
 	values := make([]complex128, slots)
 	for i := range values {
-		values[i] = complex(2*pi, 0)
+		//values[i] = complex(2*pi, 0)
+		values[i] = sampleUnitCircle()
 	}
-
 
 	/*
 	   a plaintext polynomial is in NTT form, it's represented in a (nbModuli x N) matrix of uint64
 	*/
-	plaintext := ckks.NewPlaintext(params, params.MaxLevel(), params.Scale()/r)
+	plaintext := ckks.NewPlaintext(params, params.MaxLevel(), params.Scale())
 	/*
 		//in call sequence
 		//	ckks/encoder.go line 132 encoder::Encode
@@ -181,7 +315,7 @@ func example() {
 	/*
 		here the encryptor is an instance of skEncryptor, calling EncryptNew will generate a new random element
 		of R_q in NTT form
-		the modulus are deliberately chosen(not checked, just a guess) s.t. q_i = 1 mod N
+		the modulus are deliberately chosen s.t. q_i = 1 mod 2N
 		i.e. NTT modulus is the same as non-NTT modulus
 		which means sampling a random element in NTT form is essentially the same as sampling a random element
 		in non-NTT form
@@ -194,87 +328,43 @@ func example() {
 
 	fmt.Println()
 	fmt.Println("===============================================")
-	fmt.Printf("        EVALUATION OF i*x on %d values\n", slots)
+	fmt.Printf("       EVALUATION of func on %d values\n", slots)
 	fmt.Println("===============================================")
 	fmt.Println()
 
 	start = time.Now()
 
-	evaluator.MultByi(ciphertext, ciphertext)
+	coeffs, ok := maclaurinSeries[funcTypeFlag]
+	if ok {
+		poly := ckks.NewPoly(coeffs)
 
-	fmt.Printf("Done in %s \n", time.Since(start))
-
-	for i := range values {
-		values[i] *= complex(0, 1)
-	}
-
-	printDebug(params, ciphertext, values, decryptor, encoder)
-
-	fmt.Println()
-	fmt.Println("===============================================")
-	fmt.Printf("       EVALUATION of x/r on %d values\n", slots)
-	fmt.Println("===============================================")
-	fmt.Println()
-
-	start = time.Now()
-
-	ciphertext.MulScale(r)
-
-	fmt.Printf("Done in %s \n", time.Since(start))
-
-	for i := range values {
-		values[i] /= complex(r, 0)
-	}
-
-	printDebug(params, ciphertext, values, decryptor, encoder)
-
-	fmt.Println()
-	fmt.Println("===============================================")
-	fmt.Printf("       EVALUATION of e^x on %d values\n", slots)
-	fmt.Println("===============================================")
-	fmt.Println()
-
-	start = time.Now()
-
-	coeffs := []complex128{
-		complex(1.0, 0),
-		complex(1.0, 0),
-		complex(1.0/2, 0),
-		complex(1.0/6, 0),
-		complex(1.0/24, 0),
-		complex(1.0/120, 0),
-		complex(1.0/720, 0),
-		complex(1.0/5040, 0),
-	}
-
-	poly := ckks.NewPoly(coeffs)
-
-	if ciphertext, err = evaluator.EvaluatePoly(ciphertext, poly, rlk); err != nil {
-		panic(err)
+		// TODO: evaluator.EvaluatePoly is not so simple
+		//  having something to do with 'Baby-step, Giant-step Algorithm'
+		//  I know BSGS algorithm in computing discrete logarithm
+		//  and I can vaguely guess what they want to do
+		//  but the code is so complicated for me to understand
+		//  possible ref: https://specfun.inria.fr/bostan/publications/exposeJNCF.pdf page 78
+		//  Paterson-Stockmeyer algorithm
+		//
+		// FIXME: another little bug (not necessarily) there...
+		//  in polynomial_evaluation.go line 270, recurse
+		//  shift by (logSplit - 1) when logSplit == 1 will cause a panic
+		if ciphertext, err = evaluator.EvaluatePoly(ciphertext, poly, rlk); err != nil {
+			panic(err)
+		}
+	} else if funcTypeFlag == "variance" {
+		ciphertext = homoVar(ciphertext, evaluator, rlk, rotk)
 	}
 
 	fmt.Printf("Done in %s \n", time.Since(start))
 
-	for i := range values {
-		values[i] = cmplx.Exp(values[i])
-	}
-
-	printDebug(params, ciphertext, values, decryptor, encoder)
-
-	fmt.Println()
-	fmt.Println("===============================================")
-	fmt.Printf("       EVALUATION of x^r on %d values\n", slots)
-	fmt.Println("===============================================")
-	fmt.Println()
-
-	start = time.Now()
-
-	evaluator.Power(ciphertext, uint64(r), rlk, ciphertext)
-
-	fmt.Printf("Done in %s \n", time.Since(start))
-
-	for i := range values {
-		values[i] = cmplx.Pow(values[i], complex(r, 0))
+	if ok {
+		evalVecPoly(values, coeffs)
+	} else if funcTypeFlag == "variance" {
+		plainVar := evalVecVar(values)
+		for idx := range values {
+			values[idx] = complex(plainVar, 0)
+		}
 	}
 
 	printDebug(params, ciphertext, values, decryptor, encoder)
