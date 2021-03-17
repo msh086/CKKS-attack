@@ -28,7 +28,6 @@ var maclaurinSeries = map[string][]complex128{
 		complex(1.0/720, 0),
 		complex(1.0/5040, 0),
 		complex(1.0/40320, 0)},
-		//1./2, 1./4, 0, -1./48, 0, 1./480, 0, -17./80640, 0, 31./1451520, 0
 	"sigmoid": {
 		complex(1.0/2, 0),
 		complex(1.0/4, 0),
@@ -92,8 +91,17 @@ func homoMean(ciphertext *ckks.Ciphertext, evaluator ckks.Evaluator, rotk *ckks.
 		evaluator.Add(ctxtCopy, tmp, ctxtCopy)
 	}
 	// NOTE: passing 1.0/len(...) will get an int of value 0 !!!
+	//  this is because golang doesn't make implicit type conversions (except for constant expressions)
+	//  ref https://stackoverflow.com/questions/16151199/constant-truncated-to-integer
+	// NOTE: MultByConst is conceptually the same as encode a vector of constants and then
+	//  carry out a multiplication between ciphertext and plaintext
+	//  but MultBuConst saves the trouble of encoding with a FFT
+	//  it directly gets the polynomial after encoding:
+	//  the polynomial that encodes a + bi is exactly b*x^(n/2) + a
 	evaluator.MultByConst(ctxtCopy, 1.0/float64(len(ciphertext.Value()[0].Coeffs[0])), ctxtCopy)
-	evaluator.RescaleMany(ctxtCopy, 1, ctxtCopy)
+	if err := evaluator.RescaleMany(ctxtCopy, 1, ctxtCopy); err != nil {
+		panic(err)
+	}
 	return ctxtCopy
 }
 
@@ -151,31 +159,7 @@ func evalVecVar(vec []complex128) (Var float64) {
 	return
 }
 
-//func evalPolySimple(src *ckks.Ciphertext, dst *ckks.Ciphertext, coeffs []complex128,
-//		evaluator ckks.Evaluator, encoder ckks.Encoder, relinKey *ckks.EvaluationKey, parameters *ckks.Parameters) {
-//	polyDeg := len(coeffs)
-//	bitsLen := bits.Len64(uint64(polyDeg))
-//	powerOf2s := make([]*ckks.Ciphertext, bitsLen)
-//	powerOf2s[0] = src
-//	for i := 1; i < bitsLen; i++ {
-//		powerOf2s[i] = evaluator.MulRelinNew(powerOf2s[i - 1], powerOf2s[i - 1], relinKey)
-//		evaluator.Rescale()
-//	}
-//	dst = ckks.NewCiphertext(parameters, src.Degree(), src.Level(), src.Scale())
-//	dst.Copy(src.El())
-//	tmp := ckks.NewPlaintext(parameters, src.Level(), src.Scale())
-//	valueVec := make([]complex128, 1 << parameters.LogSlots())
-//	setVec := func (val complex128) {
-//		for idx := range valueVec {
-//			valueVec[idx] = val
-//		}
-//	}
-//	setVec(coeffs[1])
-//	encoder.Encode(tmp, valueVec, parameters.LogSlots())
-//	evaluator.MulRelin(dst, tmp, relinKey)
-//}
-
-func example() {
+func run() {
 	flag.Parse()
 
 	printFLags()
@@ -343,7 +327,9 @@ func example() {
 		//  I know BSGS algorithm in computing discrete logarithm
 		//  and I can vaguely guess what they want to do
 		//  but the code is so complicated for me to understand
-		//  possible ref: https://specfun.inria.fr/bostan/publications/exposeJNCF.pdf page 78
+		//  ref: https://specfun.inria.fr/bostan/publications/exposeJNCF.pdf page 78
+		//  	 https://nlagrouporg.files.wordpress.com/2018/12/slides1.pdf
+		//	     https://epubs.siam.org/doi/10.1137/0202007
 		//  Paterson-Stockmeyer algorithm
 		//
 		// FIXME: another little bug (not necessarily) there...
@@ -451,5 +437,5 @@ func printDebug(params *ckks.Parameters, ciphertext *ckks.Ciphertext, valuesWant
 }
 
 func main() {
-	example()
+	run()
 }
