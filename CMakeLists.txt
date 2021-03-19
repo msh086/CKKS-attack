@@ -11,11 +11,21 @@ target_link_libraries(sealattack ntl gmp)
 target_link_libraries(sealattack SEAL::seal)
 include_directories(my_code)
 include_directories(my_code/tclap)
-#include_directories(SEAL/native/src)
+include_directories(SEAL/native/src)
 
 # helib attack
-add_executable(helibattack my_code/helibmain.cpp)
+add_executable(helibattack my_code/helibmain.cpp my_code/helibattack.cpp my_code/helibattack.h my_code/utils.h my_code/utils.cpp)
 find_package(helib)
 target_link_libraries(helibattack helib)
 include_directories(HElib/src)
 include_directories(HElib/include)
+
+#heaan attack
+add_executable(heaanattack my_code/heaanmain.cpp my_code/utils.cpp my_code/utils.h)
+target_link_libraries(heaanattack /home/msh/CKKS/HEAAN/HEAAN/lib/libHEAAN.a)
+target_link_libraries(heaanattack ntl gmp pthread gf2x)
+include_directories(HEAAN/HEAAN/src)
+
+#gf2 inv test
+add_executable(gf2invtest my_code/gf2invtest.cpp)
+target_link_libraries(gf2invtest ntl gmp pthread gf2x)
