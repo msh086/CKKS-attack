@@ -90,7 +90,7 @@ NTL::ZZ_pE convRing(const NTL::ZZX &src) {
 /**
  * convert element from ZZ_pE(R_q) into ZZX(Z[x])
  * */
-NTL::ZZX deconvRing(const NTL::ZZ_pE& src){
+NTL::ZZX deconvRing(const NTL::ZZ_pE &src) {
     return NTL::conv<ZZX>(NTL::conv<ZZ_pX>(src));
 }
 
@@ -125,15 +125,67 @@ NTL::ZZ_pE convModUp(const NTL::GF2E &src) {
  * recover s by computing a^-1 * (m - b)
  * NOTE: this requires the a is invertible in R_q
  * */
-NTL::ZZ_pE recoverByInv(const NTL::ZZ_pE& m, const NTL::ZZ_pE& a, const NTL::ZZ_pE& b) {
+NTL::ZZ_pE recoverByInv(const NTL::ZZ_pE &m, const NTL::ZZ_pE &a, const NTL::ZZ_pE &b) {
     NTL::ZZ_pE res = m;
     res -= b;
     try {
         res /= a;
-    } catch (NTL::ErrorObject& e) {
+    } catch (NTL::ErrorObject &e) {
         PRINTERROR(e)
     }
     return res;
+}
+
+/**
+ * b + a * s = m, with a, b, s, m in R_q
+ * recover s by splitting a into a = [a] - ([a] - a), where the natural image of a in R_2
+ * when [a] is invertible, [a] - a has even coefficients, i.e. [a] - a is nilpotent
+ * the inverse of [a] in R_q can be constructed efficiently from its inverse in R_2
+ * since [a] is invertible in R_q and [a] - a is nilpotent
+ * [a] - ([a] - a) = a is also invertible in R_q
+ * if we note [a] in R_q as f and ([a] - a) as g
+ * then a^-1 = (f - g)^-1 = f^-1 * (1 + (g * f^-1) + (g * f^-1)^2 + ... + (g * f^-1)^(k-1)), where g^k = 0
+ *
+ * the idea comes from NTRU Technical Report 9
+ * https://ntru.org/f/tr/tr009v1.pdf
+ * */
+NTL::ZZ_pE recoverByNTRUInv(const NTL::ZZ_pE &m, const NTL::ZZ_pE &a, const NTL::ZZ_pE &b) {
+    auto a2 = convModDown(a);
+    NTL::GF2E a2inv;
+    try {
+        NTL::inv(a2inv, a2);
+    } catch (NTL::ErrorObject &e) {
+        PRINTERROR(e);
+        return NTL::ZZ_pE();
+    }
+    // a = a_odd_part - a_even_part
+    auto a_odd_part = convModUp(a2); // f
+    auto a_even_part = a_odd_part - a; // g
+    auto a_odd_part_inv = convModUp(a2inv); // f^-1 in R_2, will become f^-1 in R_q
+    // compute the inverse of [a] in R_q from the inverse of [a] in R_2
+    // actually computing the sequence of the inverse of a_inv_part in R_2^(2^i), where i = 0, 1, ...
+    auto log2_q = NTL::NumBits(NTL::ZZ_p::modulus()) - 1;
+    long current_log_modulus = 1; // i = 0 in R_2^(2^i)
+    while (current_log_modulus < log2_q) {
+        a_odd_part_inv = a_odd_part_inv * (2 - a_odd_part * a_odd_part_inv);
+        current_log_modulus <<= 1;
+    }
+    // compute the inverse of a in R_q using geometric series
+    auto g_finv = a_even_part * a_odd_part_inv;
+    auto inv_a = g_finv + 1;
+    auto prev = inv_a;
+    // we don't check the exact k when g^k = 0, we use the upper bound of k = log2_q
+    for (long i = 2; i < log2_q; i++) {
+        inv_a *= g_finv;
+        inv_a += 1;
+        if (prev == inv_a) {
+            printf("early termination at %ld of %ld\n", i, log2_q);
+            break;
+        }
+    }
+    inv_a *= a_odd_part_inv;
+    // inverse of a in R_q is obtained, now compute s
+    return (m - b) * inv_a;
 }
 
 /**
@@ -142,13 +194,13 @@ NTL::ZZ_pE recoverByInv(const NTL::ZZ_pE& m, const NTL::ZZ_pE& a, const NTL::ZZ_
  * this trick takes advantage of the fact that sk_i = -1, 0, 1
  * NOTE: this requires the (a mod 2) is invertible in R_2
  * */
-NTL::ZZ_pE recoverByTrick(const NTL::ZZ_pE& m, const NTL::ZZ_pE& a, const NTL::ZZ_pE& b) {
+NTL::ZZ_pE recoverByTrick(const NTL::ZZ_pE &m, const NTL::ZZ_pE &a, const NTL::ZZ_pE &b) {
     auto m2 = convModDown(m), a2 = convModDown(a), b2 = convModDown(b);
     // compute [a]^-1
     NTL::GF2E a2inv;
     try {
         NTL::inv(a2inv, a2);
-    } catch (NTL::ErrorObject& e) {
+    } catch (NTL::ErrorObject &e) {
         PRINTERROR(e);
         return NTL::ZZ_pE();
     }
@@ -175,7 +227,8 @@ bool checkSame(const Plaintext &p1, const Plaintext &p2) {
 }
 
 int main() {
-    NTL::ZZ seed(time(nullptr));
+    auto timestamp = time(nullptr);
+    NTL::ZZ seed(timestamp);
     std::cout << "seed is " << seed << std::endl;
     NTL::SetSeed(seed);
 
@@ -195,9 +248,9 @@ int main() {
      * */
     SecretKey secretKey(ring);
 
-    int total = 1, inv_success = 0, trick_success = 0;
+    int total = 1, inv_success = 0, trick_success = 0, ntru_sucess = 0;
 
-    for(int iter = 0; iter < total; iter++) {
+    for (int iter = 0; iter < total; iter++) {
         Scheme scheme(secretKey, ring);
         scheme.addLeftRotKeys(secretKey); ///< When you need left rotation for the vectorized message
         scheme.addRightRotKeys(secretKey); ///< When you need right rotation for the vectorized message
@@ -335,6 +388,11 @@ int main() {
         std::cout << "recovery by trick ok ? " << bool(s_ring == recoverTrick) << std::endl;
 
         trick_success += s_ring == recoverTrick;
+
+        auto recoverNTRU = recoverByNTRUInv(m_ring, a_ring, b_ring);
+        std::cout << "recovery by NTRU-trick ok ? " << bool(s_ring == recoverNTRU) << std::endl;
+
+        ntru_sucess += s_ring == recoverNTRU;
 
         delete[] mvec1;
     }
