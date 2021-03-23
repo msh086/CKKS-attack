@@ -332,9 +332,9 @@ int main() {
          *  ### Note: we will note the image of a polynomial 'm' in R_q under such mapping '[m]'
          *  so the following equation holds:
          *  [b] + [a] * [s] = [m]   (Eq.1)
-         *  FIXME the statement below can be more precise, see the discussion at the end of this comment block
-         *  the ring R_2 is friendlier than R_q because the set of invertible elements in R_q is a subset of
-         *  the set of invertible elements in R_2
+         *  NOTE: actually the proportion of invertible elements in R_q and R_2 are the same: both are 0.5
+         *   however in R_2 the inverse of any invertible element can be computed using the extended Euclidean Algorithm
+         *   while the same statement doesn't hold true in R_q
          *  so with great possibility we can compute [s] = ([m] - [b]) * [a]^-1
          *  ### Note: for a polynomial 'm', we index its coefficient w.r.t x^i with 'm_i'
          *  since sk's coefficients compose of {-1, 0, 1}, [s]_i = 0 iff sk[i] = 0, and [s]_i = 1 iff sk[i] = 1 or -1
