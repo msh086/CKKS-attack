@@ -29,3 +29,7 @@ include_directories(HEAAN/HEAAN/src)
 #gf2 inv test
 add_executable(gf2invtest my_code/gf2invtest.cpp)
 target_link_libraries(gf2invtest ntl gmp pthread gf2x)
+
+#ntru tr9 test
+add_executable(tr9 my_code/tr9valid.cpp)
+target_link_libraries(tr9 ntl gmp pthread)
