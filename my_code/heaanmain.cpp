@@ -13,6 +13,9 @@
 #include <NTL/GF2E.h> // ZZ_pE when p = 2
 #include <ctime>
 #include <exception>
+#include <vector>
+#include <complex>
+#include "utils.h"
 
 #define PRINTERROR(err) std::cerr << "In function " << __FUNCTION__  << " at line " << __LINE__ << ": "\
     << e.what() << std::endl;
@@ -67,6 +70,67 @@ std::complex<double> *sampleUnitCircleArr(int n) {
     for (int i = 0; i < n; i++)
         vec[i] = sampleUnitCircle();
     return vec;
+}
+
+void homo_mean(Scheme& scheme, const Ciphertext& ciphertext) {
+    // TODO
+}
+
+void homo_variance(Scheme& scheme, const Ciphertext& ciphertext) {
+    // TODO
+}
+
+Ciphertext homo_eval_poly(Scheme& scheme, const Ciphertext& ciphertext, const std::vector<double>& coeffs) {
+    auto n_coeffs = coeffs.size();
+    if (n_coeffs <= 1)
+        throw std::invalid_argument("the polynomial to be evaluated should not be constant");
+    auto max_deg = coeffs.size() - 1;
+    auto tower_size = NTL::NumBits(max_deg);
+    std::vector<Ciphertext> tower;
+    tower.reserve(tower_size);
+    tower.emplace_back(ciphertext);
+    auto log_factor = ciphertext.logp;
+    for(long i = 1; i < tower_size; i++) {
+        Ciphertext tmp = scheme.square(tower[i - 1]);
+        scheme.reScaleByAndEqual(tmp, log_factor);
+        tower.emplace_back(tmp);
+    }
+    // c^(2^0), ..., c^(2^(tower_size - 1)) are computed
+    Ciphertext dst = ciphertext;
+    scheme.multByConstAndEqual(dst, coeffs[1], log_factor);
+    scheme.reScaleByAndEqual(dst, log_factor);
+//    return dst;
+    scheme.addConstAndEqual(dst, coeffs[0], log_factor);
+    // now dst = a_0 + a_1 * x
+    for(int deg = 2; deg < n_coeffs; deg++) {
+        unsigned int cur_deg_total_bits = NTL::NumBits(deg), cursor_bit_idx = 0;
+        for(; cursor_bit_idx < cur_deg_total_bits; cursor_bit_idx++) {
+            if ((1 << cursor_bit_idx) & deg)
+                break;
+        }
+
+        if (fabs(coeffs[deg]) * exp2(tower[cursor_bit_idx].logp) < 0.5) // too small s.t. encoding results is zero poly
+            continue;
+
+        Ciphertext tmp_ciphertext = tower[cursor_bit_idx];
+        scheme.multByConstAndEqual(tmp_ciphertext, coeffs[deg], log_factor);
+        scheme.reScaleByAndEqual(tmp_ciphertext, log_factor);
+        while(++cursor_bit_idx < cur_deg_total_bits){
+            if((1 << cursor_bit_idx) & deg){
+                scheme.multAndEqual(tmp_ciphertext, tower[cursor_bit_idx]);
+                scheme.reScaleByAndEqual(tmp_ciphertext, log_factor);
+            } else{
+                scheme.multByConstAndEqual(tmp_ciphertext, 1, log_factor);
+                scheme.reScaleByAndEqual(tmp_ciphertext, log_factor);
+            }
+        }
+        while(dst.logq > tmp_ciphertext.logq){
+            scheme.multByConstAndEqual(dst, 1, log_factor);
+            scheme.reScaleByAndEqual(dst, log_factor);
+        }
+        scheme.addAndEqual(dst, tmp_ciphertext);
+    }
+    return dst; // no move constructor, memory leak here
 }
 
 /**
@@ -279,13 +343,28 @@ int main() {
 //        long idx = 1;
 //        Ciphertext cipherRot = scheme.leftRotate(cipher1, idx);
 
+        const std::vector<double> &coeffs = utils::func_map.at(utils::F_SIGMOID);
+//        const std::vector<double> &coeffs = {0, 1};
+
+        auto homo_res = homo_eval_poly(scheme, cipher1, coeffs);
+
+        std::vector<std::complex<double>> plain_vec_src, plain_vec_dst;
+        plain_vec_src.assign(mvec1, mvec1 + slots);
+        utils::element_wise_eval_polynomial(coeffs, plain_vec_src,
+                                                             plain_vec_dst);
+
         // choose attack victim //
-        Ciphertext &victim = cipher1;
+        Ciphertext &victim = homo_res;
 
         // Decrypt //
         Plaintext dmsg1 = scheme.decryptMsg(secretKey, victim);
         unsignedToSigned(dmsg1);
         std::complex<double> *dvec1 = scheme.decode(dmsg1);
+
+        // Compare results //
+        std::vector<std::complex<double>> homo_vec_res(dvec1, dvec1 + dmsg1.n);
+        printf("max error = %f\n", utils::max_error(plain_vec_dst, homo_vec_res));
+        printf("rel error = %f\n", utils::relative_error(plain_vec_dst, homo_vec_res));
 
         // attack
         // HEAAN will scale the inv-embedded polynomial by 2^(logp + ring.logQ)
