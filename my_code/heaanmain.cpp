@@ -15,6 +15,7 @@
 #include <exception>
 #include <vector>
 #include <complex>
+#include <cmath>
 #include "utils.h"
 
 #define PRINTERROR(err) std::cerr << "In function " << __FUNCTION__  << " at line " << __LINE__ << ": "\
@@ -282,6 +283,53 @@ NTL::ZZ_pE recoverByTrick(const NTL::ZZ_pE &m, const NTL::ZZ_pE &a, const NTL::Z
     return (-2) * convModUp(h2) + convModUp(s2);
 }
 
+/**
+ * perform Monte Carlo simulation to test the probability that an uniformly drawn sample from R_q is invertible
+ * under the Extended Euclidean Algorithm, where q is a power of 2
+ * the 'normal_bound' is the z-score of some significance level, i.e for alpha smaller but close to 1,
+ * P(|x| > normal_bound) = 1 - a
+ * the 'precision' is half the width of the confidence interval
+ * let u = normal_bound, r = precision, the minimum sample needed 'n' will be calculated as
+ *  n >= (u / 2r)^2 - u^2
+ * while yielding a significance level of erf(u / sqrt(2))
+ *
+ * P.S. it would seem more natural to accept a parameter of significance level rather than the bound related to it
+ * but the inverse of erf(or erfc) is not given in std, and I'm lazy to find one, so it comes this way
+ * */
+void monte_carlo_sim(double normal_bound, double precision) {
+    // use the default ZZ_pE ring
+    normal_bound = fabs(normal_bound);
+    precision = fabs(precision);
+    uint64_t n_samp = std::ceil(normal_bound * normal_bound * (1 / (4 * precision * precision) - 1));
+    NTL::ZZ_pE a;
+    uint64_t success_count = 0;
+    for(uint64_t i = 0; i < n_samp; i++) {
+        NTL::random(a);
+        try {
+            NTL::inv(a);
+        } catch (NTL::ErrorObject& e) {
+            continue;
+        }
+        success_count += 1;
+    }
+    // experiment done, compute confidence interval
+    double p_observed = double(success_count) / n_samp;
+//    p_observed += normal_bound * normal_bound / (2.0 * n_samp);
+    double actual_precision = normal_bound * std::sqrt(p_observed * (1 - p_observed) / n_samp
+            + normal_bound * normal_bound / (4.0 * n_samp * n_samp));
+    double scale = n_samp / (n_samp + normal_bound * normal_bound);
+    double p_guess = p_observed + normal_bound * normal_bound / (2.0 * n_samp);
+    double lower = scale * (p_guess - actual_precision), upper = scale * (p_guess + actual_precision);
+    double sig_level = std::erf(normal_bound / std::sqrt(2));
+    printf("bound for standard normal distribution: %f, required precision: %f, significant level: %f\n"
+           "sample size: %lu\n"
+           "guessed EEA-invertible probability: %f\n"
+           "confidence interval: (%f, %f)\n",
+           normal_bound, precision, sig_level,
+           n_samp,
+           p_guess,
+           lower, upper);
+}
 
 bool checkSame(const Plaintext &p1, const Plaintext &p2) {
     long n = p1.n;
@@ -482,6 +530,8 @@ int main() {
 
         delete[] mvec1;
     }
+
+    monte_carlo_sim(3.3, 0.01);
 
     printf("inv success: %d\ntrick success: %d\ntotal: %d\n", inv_success, trick_success, total);
 
