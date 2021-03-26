@@ -72,15 +72,15 @@ std::complex<double> *sampleUnitCircleArr(int n) {
     return vec;
 }
 
-void homo_mean(Scheme& scheme, const Ciphertext& ciphertext) {
+void homo_mean(Scheme &scheme, const Ciphertext &ciphertext) {
     // TODO
 }
 
-void homo_variance(Scheme& scheme, const Ciphertext& ciphertext) {
+void homo_variance(Scheme &scheme, const Ciphertext &ciphertext) {
     // TODO
 }
 
-Ciphertext homo_eval_poly(Scheme& scheme, const Ciphertext& ciphertext, const std::vector<double>& coeffs) {
+Ciphertext homo_eval_poly(Scheme &scheme, const Ciphertext &ciphertext, const std::vector<double> &coeffs) {
     auto n_coeffs = coeffs.size();
     if (n_coeffs <= 1)
         throw std::invalid_argument("the polynomial to be evaluated should not be constant");
@@ -90,7 +90,7 @@ Ciphertext homo_eval_poly(Scheme& scheme, const Ciphertext& ciphertext, const st
     tower.reserve(tower_size);
     tower.emplace_back(ciphertext);
     auto log_factor = ciphertext.logp;
-    for(long i = 1; i < tower_size; i++) {
+    for (long i = 1; i < tower_size; i++) {
         Ciphertext tmp = scheme.square(tower[i - 1]);
         scheme.reScaleByAndEqual(tmp, log_factor);
         tower.emplace_back(tmp);
@@ -102,9 +102,9 @@ Ciphertext homo_eval_poly(Scheme& scheme, const Ciphertext& ciphertext, const st
 //    return dst;
     scheme.addConstAndEqual(dst, coeffs[0], log_factor);
     // now dst = a_0 + a_1 * x
-    for(int deg = 2; deg < n_coeffs; deg++) {
+    for (int deg = 2; deg < n_coeffs; deg++) {
         unsigned int cur_deg_total_bits = NTL::NumBits(deg), cursor_bit_idx = 0;
-        for(; cursor_bit_idx < cur_deg_total_bits; cursor_bit_idx++) {
+        for (; cursor_bit_idx < cur_deg_total_bits; cursor_bit_idx++) {
             if ((1 << cursor_bit_idx) & deg)
                 break;
         }
@@ -115,16 +115,16 @@ Ciphertext homo_eval_poly(Scheme& scheme, const Ciphertext& ciphertext, const st
         Ciphertext tmp_ciphertext = tower[cursor_bit_idx];
         scheme.multByConstAndEqual(tmp_ciphertext, coeffs[deg], log_factor);
         scheme.reScaleByAndEqual(tmp_ciphertext, log_factor);
-        while(++cursor_bit_idx < cur_deg_total_bits){
-            if((1 << cursor_bit_idx) & deg){
+        while (++cursor_bit_idx < cur_deg_total_bits) {
+            if ((1 << cursor_bit_idx) & deg) {
                 scheme.multAndEqual(tmp_ciphertext, tower[cursor_bit_idx]);
                 scheme.reScaleByAndEqual(tmp_ciphertext, log_factor);
-            } else{
+            } else {
                 scheme.multByConstAndEqual(tmp_ciphertext, 1, log_factor);
                 scheme.reScaleByAndEqual(tmp_ciphertext, log_factor);
             }
         }
-        while(dst.logq > tmp_ciphertext.logq){
+        while (dst.logq > tmp_ciphertext.logq) {
             scheme.multByConstAndEqual(dst, 1, log_factor);
             scheme.reScaleByAndEqual(dst, log_factor);
         }
@@ -203,12 +203,20 @@ NTL::ZZ_pE recoverByInv(const NTL::ZZ_pE &m, const NTL::ZZ_pE &a, const NTL::ZZ_
 /**
  * b + a * s = m, with a, b, s, m in R_q
  * recover s by splitting a into a = [a] - ([a] - a), where the natural image of a in R_2
- * when [a] is invertible, [a] - a has even coefficients, i.e. [a] - a is nilpotent
+ * if [a] is invertible, [a] - a has even coefficients, i.e. [a] - a is nilpotent
  * the inverse of [a] in R_q can be constructed efficiently from its inverse in R_2
  * since [a] is invertible in R_q and [a] - a is nilpotent
  * [a] - ([a] - a) = a is also invertible in R_q
  * if we note [a] in R_q as f and ([a] - a) as g
  * then a^-1 = (f - g)^-1 = f^-1 * (1 + (g * f^-1) + (g * f^-1)^2 + ... + (g * f^-1)^(k-1)), where g^k = 0
+ *
+ * NOTE: this algorithm requires the (a mod 2) is invertible in R_2
+ *
+ * let q = 2^k, e = ceil(log_2(k))
+ * this algorithm requires:
+ * multiplication in R_q    2*e + 1 + 2*(e-1) + 1 + 1 = 4 * e + 1
+ * addition in R_q          1 + e + 1 + (e-1) + 1 = 2 * e + 2
+ * inversion in R_2         1
  *
  * the idea comes from NTRU Technical Report 9
  * https://ntru.org/f/tr/tr009v1.pdf
@@ -219,7 +227,7 @@ NTL::ZZ_pE recoverByNTRUInv(const NTL::ZZ_pE &m, const NTL::ZZ_pE &a, const NTL:
     try {
         NTL::inv(a2inv, a2);
     } catch (NTL::ErrorObject &e) {
-        PRINTERROR(e);
+        PRINTERROR(e)
         return NTL::ZZ_pE();
     }
     // a = a_odd_part - a_even_part
@@ -229,23 +237,21 @@ NTL::ZZ_pE recoverByNTRUInv(const NTL::ZZ_pE &m, const NTL::ZZ_pE &a, const NTL:
     // compute the inverse of [a] in R_q from the inverse of [a] in R_2
     // actually computing the sequence of the inverse of a_inv_part in R_2^(2^i), where i = 0, 1, ...
     auto log2_q = NTL::NumBits(NTL::ZZ_p::modulus()) - 1;
-    long current_log_modulus = 1; // i = 0 in R_2^(2^i)
-    while (current_log_modulus < log2_q) {
-        a_odd_part_inv = a_odd_part_inv * (2 - a_odd_part * a_odd_part_inv);
-        current_log_modulus <<= 1;
-    }
+    auto ceil_logk = NTL::NumBits(log2_q - 1); // e = ceil(log_2(k))
+    for (int i = 0; i < ceil_logk; i++)
+        a_odd_part_inv *= (2 - a_odd_part * a_odd_part_inv);
     // compute the inverse of a in R_q using geometric series
     auto g_finv = a_even_part * a_odd_part_inv;
     auto inv_a = g_finv + 1;
-    auto prev = inv_a;
     // we don't check the exact k when g^k = 0, we use the upper bound of k = log2_q
-    for (long i = 2; i < log2_q; i++) {
-        inv_a *= g_finv;
-        inv_a += 1;
-        if (prev == inv_a) {
-            printf("early termination at %ld of %ld\n", i, log2_q);
-            break;
-        }
+    // let x = f^-1 * g, we then (f - g)^-1 = f^-1 * (1 + x^2 + ... + x^(k-1))
+    // we also have 1 + x + ... + x^(2^e-1) = (1 + x)(1 + x^2)(1 + x^4)(1 + x^16)...(1 + x^(2^(e-1)))
+    // since x^i = 0 for i >= k, we can find the smallest e satisfying 2^e - 1 >= k - 1
+    // the compute the product of e = log2_k terms
+    for (long cur_deg = 1; cur_deg < ceil_logk; cur_deg++) {
+        // x^(2^cur_deg))
+        NTL::sqr(g_finv, g_finv);
+        inv_a *= g_finv + 1;
     }
     inv_a *= a_odd_part_inv;
     // inverse of a in R_q is obtained, now compute s
@@ -265,7 +271,7 @@ NTL::ZZ_pE recoverByTrick(const NTL::ZZ_pE &m, const NTL::ZZ_pE &a, const NTL::Z
     try {
         NTL::inv(a2inv, a2);
     } catch (NTL::ErrorObject &e) {
-        PRINTERROR(e);
+        PRINTERROR(e)
         return NTL::ZZ_pE();
     }
     // compute [s]
@@ -292,6 +298,7 @@ bool checkSame(const Plaintext &p1, const Plaintext &p2) {
 
 int main() {
     auto timestamp = time(nullptr);
+    timestamp = 1616738627;
     NTL::ZZ seed(timestamp);
     std::cout << "seed is " << seed << std::endl;
     NTL::SetSeed(seed);
@@ -351,7 +358,7 @@ int main() {
         std::vector<std::complex<double>> plain_vec_src, plain_vec_dst;
         plain_vec_src.assign(mvec1, mvec1 + slots);
         utils::element_wise_eval_polynomial(coeffs, plain_vec_src,
-                                                             plain_vec_dst);
+                                            plain_vec_dst);
 
         // choose attack victim //
         Ciphertext &victim = homo_res;
@@ -383,7 +390,7 @@ int main() {
         std::cout << "re-encoding ok ? " << std::boolalpha << checkSame(re_encoded, dmsg1) << std::endl;
 
         // init rings
-        NTL::ZZ_p::init(ring.Q);
+        NTL::ZZ_p::init(NTL::ZZ(1) << victim.logq);
         NTL::ZZX PhiM;
         PhiM.SetLength(ring.N + 1);
         PhiM[0] = 1;
