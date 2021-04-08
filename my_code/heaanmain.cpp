@@ -16,6 +16,7 @@
 #include <vector>
 #include <complex>
 #include <cmath>
+#include "tclap/CmdLine.h"
 #include "utils.h"
 
 #define PRINTERROR(err) std::cerr << "In function " << __FUNCTION__  << " at line " << __LINE__ << ": "\
@@ -73,17 +74,37 @@ std::complex<double> *sampleUnitCircleArr(int n) {
     return vec;
 }
 
-void homo_mean(Scheme &scheme, const Ciphertext &ciphertext) {
-    // TODO
+void homo_mean(Scheme &scheme, Ciphertext &ciphertext) {
+    for (int i = 0; i < scheme.ring.logNh; i++) {
+        auto tmp = scheme.leftRotateFast(ciphertext, 1 << i);
+        scheme.addAndEqual(ciphertext, tmp);
+    }
+    auto log_scale = ciphertext.logp;
+    scheme.multByConstAndEqual(ciphertext, 1. / scheme.ring.Nh, log_scale);
+    scheme.reScaleByAndEqual(ciphertext, log_scale);
 }
 
-void homo_variance(Scheme &scheme, const Ciphertext &ciphertext) {
-    // TODO
+Ciphertext homo_variance(Scheme &scheme, const Ciphertext &ciphertext) {
+    auto log_scale = ciphertext.logp;
+    auto mean_sqr = ciphertext, copy = ciphertext;
+    scheme.conjugateAndEqual(mean_sqr); // conj(x)
+    scheme.multAndEqual(mean_sqr, copy); // 0, level, ||x^2||
+    scheme.reScaleByAndEqual(mean_sqr, log_scale); // -1 level, ||x^2||
+    homo_mean(scheme, mean_sqr); // -2 level, mean(||x^2||)
+    homo_mean(scheme, copy);
+    auto sqr_mean = copy; // -1 level, mean(x)
+    scheme.conjugateAndEqual(sqr_mean); // -1 level, conj(mean(x))
+    scheme.multAndEqual(sqr_mean, copy); // -1 level, ||mean(x)^2||
+    scheme.reScaleByAndEqual(sqr_mean, log_scale); // -2 level, ||mean(x)^2||
+    scheme.subAndEqual(mean_sqr, sqr_mean); // -2 level, var(x)
+    return mean_sqr;
 }
 
 Ciphertext homo_eval_poly(Scheme &scheme, const Ciphertext &ciphertext, const std::vector<double> &coeffs) {
     auto n_coeffs = coeffs.size();
-    if (n_coeffs <= 1)
+    if (n_coeffs == 0)
+        return ciphertext;
+    if (n_coeffs == 1)
         throw std::invalid_argument("the polynomial to be evaluated should not be constant");
     auto max_deg = coeffs.size() - 1;
     auto tower_size = NTL::NumBits(max_deg);
@@ -100,7 +121,6 @@ Ciphertext homo_eval_poly(Scheme &scheme, const Ciphertext &ciphertext, const st
     Ciphertext dst = ciphertext;
     scheme.multByConstAndEqual(dst, coeffs[1], log_factor);
     scheme.reScaleByAndEqual(dst, log_factor);
-//    return dst;
     scheme.addConstAndEqual(dst, coeffs[0], log_factor);
     // now dst = a_0 + a_1 * x
     for (int deg = 2; deg < n_coeffs; deg++) {
@@ -131,7 +151,7 @@ Ciphertext homo_eval_poly(Scheme &scheme, const Ciphertext &ciphertext, const st
         }
         scheme.addAndEqual(dst, tmp_ciphertext);
     }
-    return dst; // no move constructor, memory leak here
+    return dst; // will RVO or NRVO optimize this out?
 }
 
 /**
@@ -183,6 +203,14 @@ NTL::ZZ_pE convModUp(const NTL::GF2E &src) {
                     )
             )
     );
+}
+
+NTL::ZZ_pE addNoise(Ring &ring, const NTL::ZZ_pE &m) {
+    auto *tmp = new NTL::ZZ[ring.N];
+    ring.sampleGauss(tmp);
+    auto res = composeZZArray(tmp, ring.N);
+    delete[] tmp;
+    return convRing(res) + m;
 }
 
 /**
@@ -303,11 +331,11 @@ void monte_carlo_sim(double normal_bound, double precision) {
     uint64_t n_samp = std::ceil(normal_bound * normal_bound * (1 / (4 * precision * precision) - 1));
     NTL::ZZ_pE a;
     uint64_t success_count = 0;
-    for(uint64_t i = 0; i < n_samp; i++) {
+    for (uint64_t i = 0; i < n_samp; i++) {
         NTL::random(a);
         try {
             NTL::inv(a);
-        } catch (NTL::ErrorObject& e) {
+        } catch (NTL::ErrorObject &e) {
             continue;
         }
         success_count += 1;
@@ -316,7 +344,7 @@ void monte_carlo_sim(double normal_bound, double precision) {
     double p_observed = double(success_count) / n_samp;
 //    p_observed += normal_bound * normal_bound / (2.0 * n_samp);
     double actual_precision = normal_bound * std::sqrt(p_observed * (1 - p_observed) / n_samp
-            + normal_bound * normal_bound / (4.0 * n_samp * n_samp));
+                                                       + normal_bound * normal_bound / (4.0 * n_samp * n_samp));
     double scale = n_samp / (n_samp + normal_bound * normal_bound);
     double p_guess = p_observed + normal_bound * normal_bound / (2.0 * n_samp);
     double lower = scale * (p_guess - actual_precision), upper = scale * (p_guess + actual_precision);
@@ -344,22 +372,51 @@ bool checkSame(const Plaintext &p1, const Plaintext &p2) {
     return true;
 }
 
-int main() {
-    auto timestamp = time(nullptr);
-    timestamp = 1616738627;
+int main(int argc, char *argv[]) {
+    // cmd arguments parsing
+    TCLAP::CmdLine cmdLine("HEAAN attack&defense", ' ');
+    TCLAP::ValueArg<long> seed_flag("s", "seed", "random seed", false, time(nullptr), "word-sized signed integer",
+                                    cmdLine);
+    TCLAP::ValueArg<uint64_t> logn_flag("n", "logn", "log_2(modulus polynomial degree)", false, 16,
+                                        "positive integer <= 16", cmdLine);
+    TCLAP::ValueArg<uint64_t> logq_flag("q", "logq", "log_2(ciphertext modulus)", false, 353, "positive integer",
+                                        cmdLine);
+    TCLAP::ValueArg<uint64_t> logp_flag("p", "logp", "log_2(scaling factor)", false, 30, "positive integer", cmdLine);
+    TCLAP::ValueArg<uint64_t> rounds_flag("r", "rounds", "rounds to run", false, 1, "positive integer", cmdLine);
+    TCLAP::ValuesConstraint<std::string> func_constraint({"none", "sigmoid", "exponent", "variance"});
+    TCLAP::ValueArg<std::string> func_flag("f", "func", "function to evaluate", false, "none", &func_constraint,
+                                           cmdLine);
+
+    TCLAP::SwitchArg monto_carlo_flag("m", "mc",
+                                      "run Monte Carlo Simulation to estimate the proportion of EEA-invertible elements in R_q",
+                                      cmdLine);
+    TCLAP::ValueArg<double> mc_norm_bound_flag("", "mcbound",
+                                               "the bound of standard normal distribution in Monte Carlo", false, 3.3,
+                                               "positive real number", cmdLine);
+    TCLAP::ValueArg<double> mc_precision_flag("", "mcprec", "the radius of the confidence interval in Monte Carlo",
+                                              false, 0.01, "positive real number", cmdLine);
+
+    TCLAP::SwitchArg naive_invert_flag("", "naive", "run naive inversion algorithm", cmdLine);
+    TCLAP::SwitchArg trick_invert_flag("", "trick", "run trick inversion algorithm by Li & Micciancio", cmdLine);
+    TCLAP::SwitchArg ntru_invert_flag("", "ntru", "run ntru inversion algorithm", cmdLine);
+
+    TCLAP::SwitchArg defense_flag("d", "defense", "run defense", cmdLine);
+
+    cmdLine.parse(argc, argv);
+
+    auto timestamp = seed_flag.getValue();
+//    timestamp = 1616738627;
     NTL::ZZ seed(timestamp);
     std::cout << "seed is " << seed << std::endl;
     NTL::SetSeed(seed);
 
     // Parameters //
-    long logN = 15;
-    long logQ = 353;
-    long logp = 30; ///< Larger logp will give you more correct result (smaller computation noise)
+    long logN = logn_flag.getValue();
+    long logQ = logq_flag.getValue();
+    long logp = logp_flag.getValue(); ///< Larger logp will give you more correct result (smaller computation noise)
     long slots = 1 << (logN - 1); ///< This should be power of two
-    long numThread = 8;
 
     // Construct and Generate Public Keys //
-    TimeUtils timeutils;
     Ring ring(logN, logQ);
     /**
      * hamming weight defaults to 64
@@ -367,16 +424,24 @@ int main() {
      * */
     SecretKey secretKey(ring);
 
-    int total = 1, inv_success = 0, trick_success = 0, ntru_sucess = 0;
+    int total = rounds_flag.getValue(), inv_success = 0, trick_success = 0, ntru_sucess = 0, def_success = 0;
+    auto func = func_flag.getValue();
+    utils::FuncType func_type = utils::F_NONE;
+    if (func == "sigmoid")
+        func_type = utils::F_SIGMOID;
+    else if (func == "exponent")
+        func_type = utils::F_EXPONENT;
+    else if (func == "variance")
+        func_type = utils::F_VARIANCE;
 
     for (int iter = 0; iter < total; iter++) {
         Scheme scheme(secretKey, ring);
         scheme.addLeftRotKeys(secretKey); ///< When you need left rotation for the vectorized message
         scheme.addRightRotKeys(secretKey); ///< When you need right rotation for the vectorized message
+        scheme.addConjKey(secretKey);
 
         // Make Random Array of Complex //
         std::complex<double> *mvec1 = sampleUnitCircleArr(slots);//EvaluatorUtils::randomComplexArray(slots);
-//        std::complex<double> *mvec2 = sampleUnitCircleArr(slots);//EvaluatorUtils::randomComplexArray(slots);
 
         // logp seems to be the scaling factor, while logq is the ciphertext modulus
         // Encrypt Two Arry of Complex //
@@ -385,28 +450,22 @@ int main() {
         printPlainMag(plain1);
 
         Ciphertext cipher1 = scheme.encrypt(mvec1, slots, logp, logQ);
-//        Ciphertext cipher2 = scheme.encrypt(mvec2, slots, logp, logQ);
 
-        // Addition //
-//        Ciphertext cipherAdd = scheme.add(cipher1, cipher2);
 
-        // Multiplication And Rescale //
-//        Ciphertext cipherMult = scheme.mult(cipher1, cipher2);
-//        Ciphertext cipherMultAfterReScale = scheme.reScaleBy(cipherMult, logp);
-
-        // Rotation //
-//        long idx = 1;
-//        Ciphertext cipherRot = scheme.leftRotate(cipher1, idx);
-
-        const std::vector<double> &coeffs = utils::func_map.at(utils::F_SIGMOID);
-//        const std::vector<double> &coeffs = {0, 1};
-
-        auto homo_res = homo_eval_poly(scheme, cipher1, coeffs);
+        Ciphertext homo_res;
+        if (func_type == utils::F_VARIANCE)
+            homo_res = homo_variance(scheme, cipher1);
+        else
+            homo_res = homo_eval_poly(scheme, cipher1, utils::func_map.at(func_type));
 
         std::vector<std::complex<double>> plain_vec_src, plain_vec_dst;
         plain_vec_src.assign(mvec1, mvec1 + slots);
-        utils::element_wise_eval_polynomial(coeffs, plain_vec_src,
-                                            plain_vec_dst);
+        double var = 0;
+        if (func_type == utils::F_VARIANCE)
+            utils::calc_variance(plain_vec_src, var);
+        else
+            utils::element_wise_eval_polynomial(utils::func_map.at(func_type), plain_vec_src,
+                                                plain_vec_dst);
 
         // choose attack victim //
         Ciphertext &victim = homo_res;
@@ -418,8 +477,13 @@ int main() {
 
         // Compare results //
         std::vector<std::complex<double>> homo_vec_res(dvec1, dvec1 + dmsg1.n);
-        printf("max error = %f\n", utils::max_error(plain_vec_dst, homo_vec_res));
-        printf("rel error = %f\n", utils::relative_error(plain_vec_dst, homo_vec_res));
+        if (func_type == utils::F_VARIANCE) {
+            printf("max error = %f\n", utils::max_error_1vN((std::complex<double>) var, homo_vec_res));
+            printf("rel error = %f\n", utils::max_rel_error_1vN((std::complex<double>) var, homo_vec_res));
+        } else {
+            printf("max error = %f\n", utils::max_error(plain_vec_dst, homo_vec_res));
+            printf("rel error = %f\n", utils::relative_error(plain_vec_dst, homo_vec_res));
+        }
 
         // attack
         // HEAAN will scale the inv-embedded polynomial by 2^(logp + ring.logQ)
@@ -450,12 +514,13 @@ int main() {
         auto b_ring = convRing(composeZZArray(victim.bx, ring.N));
         auto a_ring = convRing(composeZZArray(victim.ax, ring.N));
 
-        auto recover = recoverByInv(m_ring, a_ring, b_ring);
-
         auto s_ring = convRing(composeZZArray(secretKey.sx, ring.N));
-        std::cout << "recovery by inverse ok ? " << bool(s_ring == recover) << std::endl;
 
-        inv_success += s_ring == recover;
+        if (naive_invert_flag.getValue()) {
+            auto recover = recoverByInv(m_ring, a_ring, b_ring);
+            std::cout << "recovery by inverse ok ? " << bool(s_ring == recover) << std::endl;
+            inv_success += s_ring == recover;
+        }
         /**
          * maybe a is non-invertible, but when all of sk's coefficients are constrained into {-1, 0, 1}
          * we can found a way to decide such sk without computing a^-1
@@ -518,22 +583,40 @@ int main() {
          *  FIXME: I'm not sure if every step is correct in GF(2), for example
          *   is factorizing a polynomial in GF(2)[x] the same as that in Z[x]?
          * */
-        auto recoverTrick = recoverByTrick(m_ring, a_ring, b_ring);
-        std::cout << "recovery by trick ok ? " << bool(s_ring == recoverTrick) << std::endl;
+        if (trick_invert_flag.getValue()) {
+            auto recoverTrick = recoverByTrick(m_ring, a_ring, b_ring);
+            std::cout << "recovery by trick ok ? " << bool(s_ring == recoverTrick) << std::endl;
+            trick_success += s_ring == recoverTrick;
+        }
 
-        trick_success += s_ring == recoverTrick;
+        if (ntru_invert_flag.getValue()) {
+            auto recoverNTRU = recoverByNTRUInv(m_ring, a_ring, b_ring);
+            std::cout << "recovery by NTRU-trick ok ? " << bool(s_ring == recoverNTRU) << std::endl;
+            ntru_sucess += s_ring == recoverNTRU;
+        }
 
-        auto recoverNTRU = recoverByNTRUInv(m_ring, a_ring, b_ring);
-        std::cout << "recovery by NTRU-trick ok ? " << bool(s_ring == recoverNTRU) << std::endl;
-
-        ntru_sucess += s_ring == recoverNTRU;
+        // defense
+        if (defense_flag.getValue()) {
+            auto noisy = addNoise(ring, m_ring);
+            auto recoverTrickNoisy = recoverByTrick(noisy, a_ring, b_ring);
+            std::cout << "defense ok ? " << bool(s_ring != recoverTrickNoisy) << std::endl;
+            def_success += s_ring != recoverTrickNoisy;
+        }
 
         delete[] mvec1;
     }
 
-    monte_carlo_sim(3.3, 0.01);
+    if (monto_carlo_flag.getValue())
+        monte_carlo_sim(mc_norm_bound_flag.getValue(), mc_precision_flag.getValue());
 
-    printf("inv success: %d\ntrick success: %d\ntotal: %d\n", inv_success, trick_success, total);
+    if (naive_invert_flag.getValue())
+        printf("inv success: %d/%d = %f\n", inv_success, total, double(inv_success) / total);
+    if (trick_invert_flag.getValue())
+        printf("trick success: %d/%d = %f\n", trick_success, total, double(trick_success) / total);
+    if (ntru_invert_flag.getValue())
+        printf("ntru success: %d/%d = %f\n", ntru_sucess, total, double(ntru_sucess) / total);
+    if (defense_flag.getValue())
+        printf("defense success: %d/%d = %f\n", def_success, total, double(def_success) / total);
 
     return 0;
 
