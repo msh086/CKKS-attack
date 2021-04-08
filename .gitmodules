@@ -13,3 +13,6 @@
 [submodule "HEAAN"]
 	path = HEAAN
 	url = ../HEAAN
+[submodule "FullRNS-HEAAN"]
+	path = FullRNS-HEAAN
+	url = ../FullRNS-HEAAN
