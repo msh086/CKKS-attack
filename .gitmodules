@@ -16,3 +16,6 @@
 [submodule "FullRNS-HEAAN"]
 	path = FullRNS-HEAAN
 	url = ../FullRNS-HEAAN
+[submodule "palisade-release"]
+	path = palisade-release
+	url = https://gitlab.com/msh086/palisade-release.git
