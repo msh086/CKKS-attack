@@ -17,6 +17,7 @@
 #include <complex>
 #include <NTL/ZZ.h>
 #include <iostream>
+#include "tclap/CmdLine.h"
 
 using cmpl64 = std::complex<double>;
 
@@ -181,7 +182,8 @@ cmpl64 *my_decrypt(Context &context, const SecretKey &secretKey, const Ciphertex
 }
 
 bool isSame(const uint64_t *a, const uint64_t *b, int level, long N) {
-    return memcmp(a, b, level * N * sizeof(uint64_t)) == 0;
+    auto tmp = memcmp(a, b, level * N * sizeof(uint64_t));
+    return tmp == 0;
 }
 
 uint64_t maxCoeffError(Context &ctxt, const uint64_t *a, const uint64_t *b, bool isNTT = true) {
@@ -211,14 +213,119 @@ uint64_t maxCoeffError(Context &ctxt, const uint64_t *a, const uint64_t *b, bool
     return res;
 }
 
-int main() {
+// homomorphic evaluations
+void homo_mean(Scheme &scheme, Ciphertext &ciphertext) {
+    for (int i = 0; i < scheme.context.logNh; i++) {
+        auto tmp = scheme.leftRotateFast(ciphertext, 1 << i);
+        scheme.addAndEqual(ciphertext, tmp);
+    }
+    scheme.multByConstAndEqual(ciphertext, 1. / scheme.context.Nh);
+    scheme.reScaleByAndEqual(ciphertext, 1);
+}
+
+Ciphertext homo_variance(Scheme &scheme, const Ciphertext &ciphertext) {
+    auto mean_sqr = ciphertext, copy = ciphertext;
+    scheme.conjugateAndEqual(mean_sqr); // conj(x)
+    scheme.multAndEqual(mean_sqr, copy); // 0, level, ||x^2||
+    scheme.reScaleByAndEqual(mean_sqr, 1); // -1 level, ||x^2||
+    homo_mean(scheme, mean_sqr); // -2 level, mean(||x^2||)
+    homo_mean(scheme, copy);
+    auto sqr_mean = copy; // -1 level, mean(x)
+    scheme.conjugateAndEqual(sqr_mean); // -1 level, conj(mean(x))
+    scheme.multAndEqual(sqr_mean, copy); // -1 level, ||mean(x)^2||
+    scheme.reScaleByAndEqual(sqr_mean, 1); // -2 level, ||mean(x)^2||
+    scheme.subAndEqual(mean_sqr, sqr_mean); // -2 level, var(x)
+    return mean_sqr;
+}
+
+Ciphertext homo_eval_poly(Scheme &scheme, const Ciphertext &ciphertext, const std::vector<double> &coeffs) {
+    auto n_coeffs = coeffs.size();
+    if (n_coeffs == 0)
+        return ciphertext;
+    if (n_coeffs == 1)
+        throw std::invalid_argument("the polynomial to be evaluated should not be constant");
+    auto max_deg = coeffs.size() - 1;
+    auto tower_size = NTL::NumBits(max_deg);
+    std::vector<Ciphertext> tower;
+    tower.reserve(tower_size);
+    tower.emplace_back(ciphertext);
+    for (long i = 1; i < tower_size; i++) {
+        Ciphertext tmp = scheme.square(tower[i - 1]);
+        scheme.reScaleByAndEqual(tmp, 1);
+        tower.emplace_back(tmp);
+    }
+    // c^(2^0), ..., c^(2^(tower_size - 1)) are computed
+    Ciphertext dst = ciphertext;
+    scheme.multByConstAndEqual(dst, coeffs[1]);
+    scheme.reScaleByAndEqual(dst, 1);
+    scheme.addConstAndEqual(dst, coeffs[0]);
+    // now dst = a_0 + a_1 * x
+    for (int deg = 2; deg < n_coeffs; deg++) {
+        unsigned int cur_deg_total_bits = NTL::NumBits(deg), cursor_bit_idx = 0;
+        for (; cursor_bit_idx < cur_deg_total_bits; cursor_bit_idx++) {
+            if ((1 << cursor_bit_idx) & deg)
+                break;
+        }
+
+        // we can't get the scaling factor directly, and I'm lazy to compute that
+        if (fabs(coeffs[deg]) == 0) // too small s.t. encoding results is zero poly
+            continue;
+
+        Ciphertext tmp_ciphertext = tower[cursor_bit_idx];
+        scheme.multByConstAndEqual(tmp_ciphertext, coeffs[deg]);
+        scheme.reScaleByAndEqual(tmp_ciphertext, 1);
+        while (++cursor_bit_idx < cur_deg_total_bits) {
+            if ((1 << cursor_bit_idx) & deg) {
+                scheme.multAndEqual(tmp_ciphertext, tower[cursor_bit_idx]);
+                scheme.reScaleByAndEqual(tmp_ciphertext, 1);
+            } else {
+                scheme.multByConstAndEqual(tmp_ciphertext, 1);
+                scheme.reScaleByAndEqual(tmp_ciphertext, 1);
+            }
+        }
+        while (dst.l > tmp_ciphertext.l) {
+            scheme.multByConstAndEqual(dst, 1);
+            scheme.reScaleByAndEqual(dst, 1);
+        }
+        scheme.addAndEqual(dst, tmp_ciphertext);
+    }
+    return dst; // will RVO or NRVO optimize this out?
+}
+
+int main(int argc, char *argv[]) {
+    // cmd arguments parsing
+    TCLAP::CmdLine cmdLine("FullRNS-HEAAN attack&defense", ' ');
+    TCLAP::ValueArg<long> seed_flag("s", "seed", "random seed", false, time(nullptr), "word-sized signed integer",
+                                    cmdLine);
+    TCLAP::ValueArg<uint64_t> logn_flag("n", "logn", "log_2(modulus polynomial degree)", false, 16,
+                                        "positive integer <= 16", cmdLine);
+    TCLAP::ValueArg<uint64_t> logp_flag("p", "logp", "log_2(scaling factor)", false, 40, "positive integer", cmdLine);
+    TCLAP::ValueArg<uint64_t> levels_flag("l", "levels", "max levels", false, 10, "positive integer", cmdLine);
+    TCLAP::ValuesConstraint<std::string> func_constraint({"none", "sigmoid", "exponent", "variance"});
+    TCLAP::ValueArg<std::string> func_flag("f", "func", "function to evaluate", false, "none", &func_constraint,
+                                           cmdLine);
+
+    TCLAP::SwitchArg defense_flag("d", "defense", "run defense", cmdLine);
+
+    TCLAP::SwitchArg crt_compose_flag("", "crt", "use CRT reconstruction in decryption", cmdLine);
+
+    TCLAP::SwitchArg modified_decode_flag("", "md", "use modified decoding routine", cmdLine);
+
+    cmdLine.parse(argc, argv);
+
     boolalpha(std::cout);
-    NTL::SetSeed(NTL::ZZ(12345));
-    long logN = 15, logp = 40, levels = 10, specials = 11;
+    auto seed = seed_flag.getValue();
+    NTL::SetSeed(NTL::ZZ(seed));
+
+    bool use_crt_construction = crt_compose_flag.getValue(), use_modified_decoding = modified_decode_flag.getValue();
+    long logN = logn_flag.getValue(), logp = logp_flag.getValue(), levels = levels_flag.getValue(),
+            specials = levels + 1;
     long slots = 1 << (logN - 1);
     Context context(logN, logp, levels, specials);
     SecretKey secretKey(context);
     Scheme scheme(secretKey, context);
+    scheme.addConjKey(secretKey);
+    scheme.addLeftRotKeys(secretKey);
 
     std::cout << "total bits in ciphertext modulus: " << modulus_bits(context) << std::endl;
 
@@ -226,34 +333,62 @@ int main() {
     utils::sample_complex_circle(plain_vec, slots, 1);
 
     Ciphertext cipher = scheme.encrypt(plain_vec.data(), slots, levels);
-    scheme.squareAndEqual(cipher);
-    scheme.reScaleByAndEqual(cipher, 1);
-    auto dec_plain = my_decrypt_msg(context, secretKey, cipher);
-    auto dec_arr = my_decode_alloc(context, dec_plain);
-    auto dec_plain_old = scheme.decryptMsg(secretKey, cipher);
-    auto dec_arr_old = scheme.decode(dec_plain_old);
 
-    // FIXME debug
-    std::cout << "CRT reconstruct unnecessary? " << isSame(dec_plain_old.mx, dec_plain.mx, 1, context.N) << '\n';
-    // end FIXME
+    auto func = func_flag.getValue();
+    utils::FuncType func_type = utils::F_NONE;
+    if (func == "sigmoid")
+        func_type = utils::F_SIGMOID;
+    else if (func == "exponent")
+        func_type = utils::F_EXPONENT;
+    else if (func == "variance")
+        func_type = utils::F_VARIANCE;
+
+    // homomorphic eval
+    Ciphertext homo_res;
+    if (func_type == utils::F_VARIANCE)
+        homo_res = homo_variance(scheme, cipher);
+    else
+        homo_res = homo_eval_poly(scheme, cipher, utils::func_map.at(func_type));
+
+    std::vector<std::complex<double>> plain_vec_dst;
+    double var = 0;
+    if (func_type == utils::F_VARIANCE)
+        utils::calc_variance(plain_vec, var);
+    else
+        utils::element_wise_eval_polynomial(utils::func_map.at(func_type), plain_vec,
+                                            plain_vec_dst);
+
+    // decryption
+    auto dec_plain = use_crt_construction ? my_decrypt_msg(context, secretKey, homo_res) :
+                     scheme.decryptMsg(secretKey, homo_res);
+    auto dec_arr = use_modified_decoding ? my_decode_alloc(context, dec_plain) :
+                   scheme.decode(dec_plain);
 
     utils::element_wise_mult_inplace(plain_vec, plain_vec);
 
     std::vector<cmpl64> dec_vec(dec_arr, dec_arr + slots);
     delete[] dec_arr;
 
-    StringUtils::showcompare(plain_vec.data(), dec_vec.data(), 6, "val");
+    // precision estimation
+    if (func_type == utils::F_VARIANCE) {
+        printf("max error = %f\n", utils::max_error_1vN((std::complex<double>) var, dec_vec));
+        printf("rel error = %f\n", utils::max_rel_error_1vN((std::complex<double>) var, dec_vec));
+    } else {
+        printf("max error = %f\n", utils::max_error(plain_vec_dst, dec_vec));
+        printf("rel error = %f\n", utils::relative_error(plain_vec_dst, dec_vec));
+    }
+
 
     // attack
-//    auto re_encoded = scheme.encode(dec_vec.data(), slots, cipher.l);
-    auto re_encoded = my_encode_alloc(context, dec_vec.data(), slots, cipher.l);
-    std::cout << "re-encoding ok? " << isSame(re_encoded.mx, dec_plain.mx, cipher.l, context.N) << '\n';
+    long common_levels = use_crt_construction ? homo_res.l : 1;
+    auto re_encoded = my_encode_alloc(context, dec_vec.data(), slots, common_levels);
+    std::cout << "re-encoding ok? " << isSame(re_encoded.mx, dec_plain.mx, common_levels, context.N) << '\n';
 
     std::cout << "max encoding error: " << maxCoeffError(context, re_encoded.mx, dec_plain.mx) << '\n';
 
-    context.subAndEqual(re_encoded.mx, cipher.bx, cipher.l);
-    ntt_inverse(context, cipher.ax, cipher.ax, cipher.l);
-    context.mulAndEqual(re_encoded.mx, cipher.ax, cipher.l);
-    std::cout << "recovery ok? " << isSame(secretKey.sx, re_encoded.mx, cipher.l, context.N) << '\n';
+    context.subAndEqual(re_encoded.mx, homo_res.bx, common_levels);
+    ntt_inverse(context, homo_res.ax, homo_res.ax, common_levels);
+    context.mulAndEqual(re_encoded.mx, homo_res.ax, common_levels);
+    std::cout << "recovery ok? " << isSame(secretKey.sx, re_encoded.mx, common_levels, context.N) << '\n';
     return 0;
 }
