@@ -3,6 +3,11 @@
 using namespace lbcrypto;
 
 int main() {
+    std::boolalpha(std::cout);
+
+    // whether the sk holder uses insecure decoding algorithm. i.e image parts are kept and no extra noise is added
+    bool insecure_client_encoding = true;
+
     // Step 1: Setup CryptoContext
 
     // A. Specify main parameters
@@ -139,6 +144,15 @@ int main() {
     vector<double> x2 = {5.0, 4.0, 3.0, 2.0, 1.0, 0.75, 0.5, 0.25};
 
     // Encoding as plaintexts
+    /*
+     * cryptocontext.h line 1805 CryptoContextImpl::MakeCKKSPackedPlaintext
+     * cryptocontext.h line 1785 CryptoContextImpl::MakeCKKSPackedPlaintext
+     * ckkspackedencoding.cpp line 113 CKKSPackedEncoding::Encode
+     * NOTE: the image part of complex values in the input vector are cleared out before encoding
+     *  consequently we need to implement an insecure version of encoding
+     *  due to polymorphism, we cannot add a new method or add a new parameter
+     *  maybe use member fields
+     * */
     Plaintext ptxt1 = cc->MakeCKKSPackedPlaintext(x1);
     Plaintext ptxt2 = cc->MakeCKKSPackedPlaintext(x2);
 
@@ -172,7 +186,10 @@ int main() {
      *  NativeInteger<T> provides (sometimes double-precision) arithmetic on native integer type T (here it is uint64_t)
      *  NativeVector<NativeInteger<T>> provides element-wise arithmetic on array of native integers w.r.t some modulus
      *  PolyImpl<NativeVector<NativeInteger<T>>> provides arithmetic on a single tower(NTT, sampling, etc.)
-     *  DCRTPolyType<BigVector> provides arithmetic on double CRT ring elements(CRT & inv-CRT, multi-precision, etc.)
+     *  DCRTPolyImpl<BigVector> provides arithmetic on double CRT ring elements(CRT & inv-CRT, multi-precibuiltsion, etc.)
+     *
+     * NOTE: built-in inverse computation
+     *  DCRTPolyImpl<VecType>::MultiplicativeInverse
      * */
     auto cAdd = cc->EvalAdd(c1, c2);
     // Homomorphic subtraction
@@ -181,7 +198,7 @@ int main() {
     // Homomorphic scalar multiplication
     auto cScalar = cc->EvalMult(c1, 4.0);
 
-    // Homomorphic multiplication
+    // Homomorphic multiplication, relinearization is done automatically
     auto cMul = cc->EvalMult(c1, c2);
 
     // Homomorphic rotations
@@ -198,26 +215,70 @@ int main() {
               << "Results of homomorphic computations: " << std::endl;
 
     // Decrypt the result of addition
+    /*
+     * cryptocontext-impl.cpp line 43 CryptoContextImpl<DCRTPoly>::Decrypt
+     *  decryption at line 71
+     *      ckks-impl.cpp line 960 LPAlgorithmCKKS<DCRTPoly>::Decrypt
+     *  decoding at line 90
+     *      ckkspackedencoding.cpp line 330 CKKSPackedEncoding::Decode
+     *
+     * Decoding:
+     *  defense is already present
+     *  the stddev in Gaussian Distribution is 2 * (the stddev of the image part in message vector)
+     *  the image part is cleared at the end of decoding for defense
+     *
+     * NOTE: defense noise
+     *  defense noise is added in the following manner
+     *  suppose decoded vector z corresponds to the ring element msg = (m_0, m_1, ..., m_(n-1))
+     *  then conj(z) corresponds to msg' = (m_0, -m_(n-1), ..., -m_1)
+     *  2 * Image(z) = z - conj(z) corresponds to msg - msg' = (0, m_1 + m_(n-1), m_2 + m_(n-2), ..., m_1 + m_(n-1))
+     *  since only REAL vectors are accepted as inputs, the image part of z can somehow represent the error
+     *  let the stddev be the standard deviation of the n-1 non-zero coefficients in (msg - msg')/2
+     *  then the standard deviation for gaussian sampling is 2 * stddev
+     *  besides, 2 * Real(z) = z + conj(z) corresponds to msg + msg', which is used as the actual input for decoding
+     *  first (msg + msg')/2 is computed, then gaussian noise is added to each coefficient independently
+     *
+     * Full description of the defense
+     * (the polynomial coefficients are already in multi-precision representation)
+     * 1. the coefficients are rescaled s.t. the rescaling factor is exactly 2^p (where p is given by the user)
+     * 2. compute the stddev of the n-1 non-zero coefficients of (msg - msg')/2
+     * 3. if stddev < sqrt(n)/8, stddev := sqrt(n)/8 FIXME: why?
+     * 4. if log2(stddev) > p - 10, throw an exception that precision is less than 10 bits FIXME: why?
+     * 5. stddev := (M + 1) * stddev, where M defaults to 1
+     * 6. compute (msg + msg')/2
+     * 7. add gaussian noise to each coefficient in the polynomial above
+     * 8. perform decoding fft (canonical embedding)
+     * 9. clear the image part of the decoded vector
+     * 10. estimate the approximate error as round(log2(stddev * sqrt(n)))
+     * */
     cc->Decrypt(keys.secretKey, cAdd, &result);
     result->SetLength(batchSize);
-    std::cout << "x1 + x2 = " << result;
+    /*
+     * some unrelated notes on the stream operator
+     * 1. the standard library provides us with a templated stream operator on shared_ptr
+     *  its signature is
+     *      template <class T, class U, class V>
+     *      std::basic_ostream<U, V>& operator<<(std::basic_ostream<U, V>& os, const std::shared_ptr<T>& ptr);
+     * 2. the user-defined streams operator has a signature of
+     *      std::ostream& operator<<(std::ostream& out, const Plaintext item)
+     * 3. both of them are in scope (and the former can be found by ADL)
+     *  but the second one is more specified in that ostream is a specification of basic_ostream
+     *  so the user-defined version is selected by the compiler
+     * */
     std::cout << "Estimated precision in bits: " << result->GetLogPrecision()
               << std::endl;
 
     // Decrypt the result of subtraction
     cc->Decrypt(keys.secretKey, cSub, &result);
     result->SetLength(batchSize);
-//    std::cout << "x1 - x2 = " << result << std::endl;
 
     // Decrypt the result of scalar multiplication
     cc->Decrypt(keys.secretKey, cScalar, &result);
     result->SetLength(batchSize);
-//    std::cout << "4 * x1 = " << result << std::endl;
 
     // Decrypt the result of multiplication
     cc->Decrypt(keys.secretKey, cMul, &result);
     result->SetLength(batchSize);
-//    std::cout << "x1 * x2 = " << result << std::endl;
 
     // Decrypt the result of rotations
     cc->Decrypt(keys.secretKey, cRot1, &result);
@@ -226,11 +287,41 @@ int main() {
             << std::endl
             << "In rotations, very small outputs (~10^-10 here) correspond to 0's:"
             << std::endl;
-//    std::cout << "x1 rotate by 1 = " << result << std::endl;
 
-    cc->Decrypt(keys.secretKey, cRot2, &result);
+    auto &victim = cRot2;
+
+    if (insecure_client_encoding)
+        cc->set_insecure_encodings(1);
+    cc->Decrypt(keys.secretKey, victim, &result);
     result->SetLength(batchSize);
-//    std::cout << "x1 rotate by -2 = " << result << std::endl;
 
+
+    // attack
+    // decrypted polynomial
+    Plaintext decrypted = cc->GetPlaintextForDecrypt(
+            victim->GetEncodingType(), victim->GetElements()[0].GetParams(),
+            cc->GetEncodingParams());
+    cc->GetEncryptionAlgorithm()->Decrypt(keys.secretKey, victim, &decrypted->GetElement<Poly>());
+    const auto &msg = decrypted->GetElement<Poly>();
+
+    // re-encoding
+    cc->set_insecure_encodings(1);
+    auto re_encoded = cc->MakeCKKSPackedPlaintext(result->GetCKKSPackedValue(), result->GetDepth(), result->GetLevel(),
+                                                  victim->GetCryptoParameters()->GetElementParams());
+    auto &sk_ele = keys.secretKey->GetPrivateElement();
+    auto &re_encoded_ele = re_encoded->GetElement<DCRTPoly>();
+    auto re_encoded_ele_big = re_encoded_ele.CRTInterpolate();
+
+    std::cout << "re-encoding success? " << (msg == re_encoded_ele_big) << std::endl;
+    std::cout << "max encoding error= " << (msg - re_encoded_ele_big).Norm() << std::endl;
+
+    // key recovery
+    auto &m = re_encoded_ele;
+    auto b = victim->GetElements()[0], a = victim->GetElements()[1];
+    m -= b;
+    m *= a.MultiplicativeInverse();
+    auto sk_copy = sk_ele;
+    sk_copy.DropLastElements(sk_copy.GetNumOfElements() - m.GetNumOfElements());
+    std::cout << "recovery ok? " << (sk_copy == m) << std::endl;
     return 0;
 }
