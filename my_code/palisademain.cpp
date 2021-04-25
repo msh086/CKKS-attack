@@ -1,12 +1,87 @@
 #include "palisade.h"
+#include "utils.h"
+#include "tclap/CmdLine.h"
+#include <NTL/ZZ.h>
 
 using namespace lbcrypto;
 
-int main() {
+void
+homomorphic_eval_poly(const std::vector<double> &coeffs, const Ciphertext<DCRTPoly> &src, Ciphertext<DCRTPoly> &dst,
+                      CryptoContext<DCRTPoly> &cc) {
+    if (coeffs.empty()) {
+        dst = src;
+        return;
+    }
+    auto poly_deg = coeffs.size() - 1;
+    if (poly_deg == 0) {
+        throw std::invalid_argument("homomorphic evaluation of constant polynomial is not allowed");
+    }
+    auto n_deg_bits = NTL::NumBits(poly_deg);
+    std::vector<Ciphertext<DCRTPoly>> towers;
+    towers.reserve(n_deg_bits);
+    towers.emplace_back(src);
+    for (int i = 1; i < n_deg_bits; i++) {
+        towers.emplace_back(cc->Rescale(cc->EvalMult(towers[i - 1], towers[i - 1])));
+    }
+    dst = cc->EvalMult(src, coeffs[1]);
+    dst = cc->Rescale(dst);
+    dst = cc->EvalAdd(dst, coeffs[0]);
+    for (int i = 2; i <= poly_deg; i++) {
+        if (coeffs[i] == 0)
+            continue; // a very loose condition
+        int cursor = 0;
+        while (!(i & (1 << cursor)))
+            cursor++;
+        Ciphertext<DCRTPoly> tmp = towers[cursor];
+        tmp = cc->EvalMult(tmp, coeffs[i]);
+        tmp = cc->Rescale(tmp);
+        while (++cursor < n_deg_bits) {
+            if (i & (1 << cursor)) {
+                tmp = cc->EvalMult(tmp, towers[cursor]);
+                tmp = cc->Rescale(tmp);
+            } else {
+                tmp = cc->EvalMult(tmp, 1);
+                tmp = cc->Rescale(tmp);
+            }
+        }
+        while (dst->GetLevel() < tmp->GetLevel()) {
+            dst = cc->EvalMult(dst, 1);
+            dst = cc->Rescale(dst);
+        }
+        dst = cc->EvalAdd(dst, tmp);
+    }
+}
+
+void homomorphic_mean(const Ciphertext<DCRTPoly> &src, Ciphertext<DCRTPoly> &dst, CryptoContext<DCRTPoly> &cc) {
+    dst = src;
+    uint32_t n = cc->GetRingDimension();
+    uint32_t step = 1;
+    while (step < n) {
+        dst = cc->EvalAdd(dst, cc->EvalAtIndex(dst, step));
+        step <<= 1;
+    }
+    dst = cc->EvalMult(dst, 1. / n);
+    dst = cc->Rescale(dst);
+}
+
+void homomorphic_var(const Ciphertext<DCRTPoly> &src, Ciphertext<DCRTPoly> &dst, CryptoContext<DCRTPoly> &cc) {
+    // NOTE: all values are real, so their image part is ignored, and no conjugation is performed here
+    auto sqr = cc->EvalMult(src, src);
+    sqr = cc->Rescale(sqr);
+    homomorphic_mean(sqr, sqr, cc); // mean
+
+    Ciphertext<DCRTPoly> mean;
+    homomorphic_mean(src, mean, cc);
+    mean = cc->Rescale(cc->EvalMult(mean, mean));
+
+    dst = sqr - mean;
+}
+
+int main(int argc, char *argv[]) {
     std::boolalpha(std::cout);
 
     // whether the sk holder uses insecure decoding algorithm. i.e image parts are kept and no extra noise is added
-    bool insecure_client_encoding = true;
+    bool insecure_client_encoding;
 
     // Step 1: Setup CryptoContext
 
@@ -28,7 +103,7 @@ int main() {
      * For performance reasons, it's generally preferable to perform operations
      * in the shorted multiplicative depth possible.
      */
-    uint32_t multDepth = 4;
+    uint32_t multDepth;// = 4;
 
     /* A2) Bit-length of scaling factor.
      * CKKS works for real numbers, but these numbers are encoded as integers.
@@ -51,7 +126,7 @@ int main() {
      * scaling factor should be large enough to both accommodate this noise and
      * support results that match the desired accuracy.
      */
-    uint32_t scaleFactorBits = 40;
+    uint32_t scaleFactorBits;// = 40;
 
     /* A3) Number of plaintext slots used in the ciphertext.
      * CKKS packs multiple plaintext values in each ciphertext.
@@ -65,7 +140,8 @@ int main() {
      * being used for these parameters. Give ring dimension N, the maximum batch
      * size is N/2, because of the way CKKS works.
      */
-    uint32_t batchSize = 1 << 15;
+    uint32_t logN;// = 15;
+    uint32_t batchSize;// = 1 << logN;
 
     /* A4) Desired security level based on FHE standards.
      * This parameter can take four values. Three of the possible values
@@ -83,12 +159,58 @@ int main() {
      * http://homomorphicencryption.org/wp-content/uploads/2018/11/HomomorphicEncryptionStandardv1.1.pdf
      */
     SecurityLevel securityLevel = HEStd_NotSet;
+    // NOTE: we set security level to none s.t. we can use the current set of parameters
+
+    std::string homoFunc;
+    utils::FuncType funcType;
+
+    std::string mode;
+    // now parse arguments
+    TCLAP::CmdLine cmdLine("CKKS key recovery attack for PALISADE", ' ');
+    {
+        TCLAP::ValueArg<uint32_t> multDepthArg("l", "level", "maximum multiplicative levels", false, 4,
+                                               "non-negative integer", cmdLine);
+        TCLAP::ValueArg<uint32_t> logScaleArg("s", "logs", "log2(scaling factor)", false, 40, "positive integer",
+                                              cmdLine);
+        TCLAP::ValueArg<uint32_t> logNArg("n", "logn", "log2(n) where n is the ring dimension", false, 15,
+                                          "positive integer", cmdLine);
+        TCLAP::ValuesConstraint<std::string> homoFuncCstr({"none", "sigmoid", "exponent", "variance"});
+        TCLAP::ValueArg<std::string> homoFuncArg("f", "func", "homomorphic function to evaluate", false, "none",
+                                                 &homoFuncCstr, cmdLine);
+        TCLAP::ValuesConstraint<std::string> modeCstr({"attack", "defense"});
+        TCLAP::ValueArg<std::string> modeArg("m", "mode", "which mode to run", false, "element in {attack, defense}",
+                                             &modeCstr, cmdLine);
+        TCLAP::SwitchArg insecureArg("i", "insec", "whether to use insecure decoding", cmdLine);
+
+        cmdLine.parse(argc, argv);
+        multDepth = multDepthArg.getValue();
+        scaleFactorBits = logScaleArg.getValue();
+        logN = logNArg.getValue();
+        batchSize = 1 << logN;
+        homoFunc = homoFuncArg.getValue();
+        if (homoFunc == "variance")
+            funcType = utils::F_VARIANCE;
+        else if (homoFunc == "sigmoid")
+            funcType = utils::F_SIGMOID;
+        else if (homoFunc == "exponent")
+            funcType = utils::F_EXPONENT;
+        else if (homoFunc == "none")
+            funcType = utils::F_NONE;
+        else // should never reach here
+            throw std::invalid_argument("unknown function type");
+        mode = modeArg.getValue();
+        insecure_client_encoding = insecureArg.getValue();
+    }
 
     // The following call creates a CKKS crypto context based on the
     // arguments defined above.
     CryptoContext<DCRTPoly> cc =
             CryptoContextFactory<DCRTPoly>::genCryptoContextCKKS(
-                    multDepth, scaleFactorBits, batchSize, securityLevel, 1 << 16);
+                    multDepth, scaleFactorBits, batchSize, securityLevel, 1 << 16, RescalingTechnique::APPROXRESCALE);
+
+//    auto rsTech =
+//            std::static_pointer_cast<LPCryptoParametersCKKS<DCRTPoly>>(
+//                    cc->GetCryptoParameters())->GetRescalingTechnique();
 
     std::cout << "CKKS scheme is using ring dimension " << cc->GetRingDimension()
               << std::endl
@@ -97,6 +219,7 @@ int main() {
     // Enable the features that you wish to use
     cc->Enable(ENCRYPTION);
     cc->Enable(SHE);
+    cc->Enable(PKESchemeFeature::LEVELEDSHE);
 
     // B. Step 2: Key Generation
     /* B1) Generate encryption keys.
@@ -135,13 +258,21 @@ int main() {
      * in the output of this demo, since CKKS is approximate, zeros are not exact
      * - they're just very small numbers.
      */
-    cc->EvalAtIndexKeyGen(keys.secretKey, {1, -2});
+    {
+        std::vector<int32_t> rot_steps;
+        int32_t step = 1;
+        for (int i = 0; i < 15; i++, step <<= 1)
+            rot_steps.push_back(step);
+        // conjugation is not allowed in ckks. ref: ckks.cpp line 788 EvalAutomorphismKeyGen
+//        rot_steps.push_back(cc->GetCyclotomicOrder() - 1); // conjugate key
+        cc->EvalAtIndexKeyGen(keys.secretKey, rot_steps);
+    }
 
     // Step 3: Encoding and encryption of inputs
 
     // Inputs
-    vector<double> x1 = {0.25, 0.5, 0.75, 1.0, 2.0, 3.0, 4.0, 5.0};
-    vector<double> x2 = {5.0, 4.0, 3.0, 2.0, 1.0, 0.75, 0.5, 0.25};
+    vector<double> x1;
+    utils::sample_double(x1, batchSize, 1);
 
     // Encoding as plaintexts
     /*
@@ -154,21 +285,15 @@ int main() {
      *  maybe use member fields
      * */
     Plaintext ptxt1 = cc->MakeCKKSPackedPlaintext(x1);
-    Plaintext ptxt2 = cc->MakeCKKSPackedPlaintext(x2);
-
-    std::cout << "Input x1: " << ptxt1 << std::endl;
-    std::cout << "Input x2: " << ptxt2 << std::endl;
 
     // Encrypt the encoded vectors
     /*
      * ckks-impl.cpp line 716 LPAlgorithmCKKS<DCRTPoly>::Encrypt
      * */
     auto c1 = cc->Encrypt(keys.publicKey, ptxt1);
-    auto c2 = cc->Encrypt(keys.publicKey, ptxt2);
 
     // Step 4: Evaluation
 
-    // Homomorphic addition
     /*
      * NOTE: DCRTPoly := DCRTPolyImpl<BigVector>
      * ckks.cpp line 271 LPAlgorithmSHECKKS<Element>::EvalAdd // with Element = DCRTPoly
@@ -191,20 +316,6 @@ int main() {
      * NOTE: built-in inverse computation
      *  DCRTPolyImpl<VecType>::MultiplicativeInverse
      * */
-    auto cAdd = cc->EvalAdd(c1, c2);
-    // Homomorphic subtraction
-    auto cSub = cc->EvalSub(c1, c2);
-
-    // Homomorphic scalar multiplication
-    auto cScalar = cc->EvalMult(c1, 4.0);
-
-    // Homomorphic multiplication, relinearization is done automatically
-    auto cMul = cc->EvalMult(c1, c2);
-
-    // Homomorphic rotations
-    auto cRot1 = cc->EvalAtIndex(c1, 1);
-    auto cRot2 = cc->EvalAtIndex(c1, -2);
-
     // Step 5: Decryption and output
     Plaintext result;
     // We set the cout precision to 8 decimal digits for a nicer output.
@@ -251,8 +362,8 @@ int main() {
      * 9. clear the image part of the decoded vector
      * 10. estimate the approximate error as round(log2(stddev * sqrt(n)))
      * */
-    cc->Decrypt(keys.secretKey, cAdd, &result);
-    result->SetLength(batchSize);
+//    cc->Decrypt(keys.secretKey, cAdd, &result);
+//    result->SetLength(batchSize);
     /*
      * some unrelated notes on the stream operator
      * 1. the standard library provides us with a templated stream operator on shared_ptr
@@ -265,36 +376,35 @@ int main() {
      *  but the second one is more specified in that ostream is a specification of basic_ostream
      *  so the user-defined version is selected by the compiler
      * */
-    std::cout << "Estimated precision in bits: " << result->GetLogPrecision()
-              << std::endl;
 
-    // Decrypt the result of subtraction
-    cc->Decrypt(keys.secretKey, cSub, &result);
-    result->SetLength(batchSize);
+    Ciphertext<DCRTPoly> homo_func_res;
+    double plain_var;
+    if (funcType == utils::F_VARIANCE) {
+        homomorphic_var(c1, c1, cc);
+        utils::calc_variance(x1, plain_var);
+    } else {
+        homomorphic_eval_poly(utils::func_map.at(funcType), c1, homo_func_res, cc);
+        utils::element_wise_eval_polynomial_inplace(utils::func_map.at(funcType), x1);
+    }
 
-    // Decrypt the result of scalar multiplication
-    cc->Decrypt(keys.secretKey, cScalar, &result);
-    result->SetLength(batchSize);
-
-    // Decrypt the result of multiplication
-    cc->Decrypt(keys.secretKey, cMul, &result);
-    result->SetLength(batchSize);
-
-    // Decrypt the result of rotations
-    cc->Decrypt(keys.secretKey, cRot1, &result);
-    result->SetLength(batchSize);
-    std::cout
-            << std::endl
-            << "In rotations, very small outputs (~10^-10 here) correspond to 0's:"
-            << std::endl;
-
-    auto &victim = cRot2;
+    auto &victim = homo_func_res;
 
     if (insecure_client_encoding)
         cc->set_insecure_encodings(1);
     cc->Decrypt(keys.secretKey, victim, &result);
     result->SetLength(batchSize);
+    std::cout << "Estimated precision in bits: " << result->GetLogPrecision()
+              << std::endl;
 
+    std::vector<double> real_res(batchSize);
+    for (int i = 0; i < batchSize; i++)
+        real_res[i] = result->GetCKKSPackedValue()[i].real();
+    if (funcType == utils::F_VARIANCE)
+        std::cout << "Max error: " << utils::max_error_1vN(plain_var, real_res) <<
+                  " Rel error: " << utils::max_rel_error_1vN(plain_var, real_res) << std::endl;
+    else
+        std::cout << "Max error: " << utils::max_error(x1, real_res) <<
+                  " Rel error: " << utils::relative_error(x1, real_res) << std::endl;
 
     // attack
     // decrypted polynomial
@@ -306,13 +416,12 @@ int main() {
 
     // re-encoding
     cc->set_insecure_encodings(1);
-    auto re_encoded = cc->MakeCKKSPackedPlaintext(result->GetCKKSPackedValue(), result->GetDepth(), result->GetLevel(),
-                                                  victim->GetCryptoParameters()->GetElementParams());
+    auto re_encoded = cc->MakeCKKSPackedPlaintext(result->GetCKKSPackedValue(), result->GetDepth(), result->GetLevel());
     auto &sk_ele = keys.secretKey->GetPrivateElement();
     auto &re_encoded_ele = re_encoded->GetElement<DCRTPoly>();
     auto re_encoded_ele_big = re_encoded_ele.CRTInterpolate();
 
-    std::cout << "re-encoding success? " << (msg == re_encoded_ele_big) << std::endl;
+//    std::cout << "re-encoding success? " << (msg == re_encoded_ele_big) << std::endl;
     std::cout << "max encoding error= " << (msg - re_encoded_ele_big).Norm() << std::endl;
 
     // key recovery
