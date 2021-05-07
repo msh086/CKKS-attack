@@ -501,6 +501,21 @@ int main(int argc, char *argv[]) {
 
         std::cout << "re-encoding ok ? " << std::boolalpha << checkSame(re_encoded, dmsg1) << std::endl;
 
+        // NOTE: HEAAN defense is provided by Scheme::decryptForShare
+        //  which is not contained in any tagged version
+        //  the function that adds a gaussian noise to a polynomial is implemented in Ring::addGaussAndEqual
+        //  the function takes a sigma as parameter, and samples from a 2-D gaussian dist composed of two independent
+        //  gaussian distribution with stddev of sigma
+        //  the defense function(Scheme.cpp line 333 Scheme::decryptForShare) is described as below:
+        //  1. decrypt message
+        //  2. sigma1 = 3.2*sqrt(2)
+        //  3. if logErrBound == -1:
+        //      sigma2 = 8*sigma1 / sqrt(2pi*sigma1^2-64)
+        //     else:
+        //      sigma2 = 2^(logErrBound) / sqrt(2pi)
+        //     (note that logErrBound defaults to 0)
+        //  4. add gaussian noise with stddev of sigma2 to each coefficient of message
+
         // init rings
         NTL::ZZ_p::init(NTL::ZZ(1) << victim.logq);
         NTL::ZZX PhiM;
