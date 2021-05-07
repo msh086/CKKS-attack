@@ -49,6 +49,15 @@ Plaintext my_decrypt_msg(Context &ctxt, const SecretKey &secretKey, const Cipher
     return Plaintext(plain, ciphertext.N, ciphertext.slots, ciphertext.l);
 }
 
+Plaintext add_gaussian_noise(Context &ctxt, const SecretKey &secretKey, const Plaintext &plaintext) {
+    auto *ex = new uint64_t[plaintext.l << ctxt.logN];
+    ctxt.sampleGauss(ex, plaintext.l);
+    ctxt.NTTAndEqual(ex, plaintext.l);
+    Plaintext res = plaintext;
+    ctxt.addAndEqual(res.mx, ex, plaintext.l);
+    return res;
+}
+
 /**
  * memory layout:
  * [N] [N] ... [N], number of [N] is l
@@ -200,11 +209,16 @@ uint64_t maxCoeffError(Context &ctxt, const uint64_t *a, const uint64_t *b, bool
         b_coeffs = const_cast<uint64_t *>(b);
     }
     uint64_t res = 0;
+    uint64_t half = ctxt.qVec[0] >> 1;
     for (int i = 0; i < ctxt.N; i++) {
+        uint64_t tmp;
         if (a_coeffs[i] > b_coeffs[i])
-            res = std::max(res, a_coeffs[i] - b_coeffs[i]);
+            tmp = a_coeffs[i] - b_coeffs[i];
         else if (a_coeffs[i] < b_coeffs[i])
-            res = std::max(res, b_coeffs[i] - a_coeffs[i]);
+            tmp = b_coeffs[i] - a_coeffs[i];
+        if (tmp >= half)
+            tmp = ctxt.qVec[0] - tmp;
+        res = std::max(res, tmp);
     }
     if (isNTT) {
         delete[] a_coeffs;
@@ -361,8 +375,14 @@ int main(int argc, char *argv[]) {
     // decryption
     auto dec_plain = use_crt_construction ? my_decrypt_msg(context, secretKey, homo_res) :
                      scheme.decryptMsg(secretKey, homo_res);
+    // defense
+    auto victim = defense_flag.getValue() ? add_gaussian_noise(context, secretKey, dec_plain) : dec_plain;
+
+    // decoding
     auto dec_arr = use_modified_decoding ? my_decode_alloc(context, dec_plain) :
                    scheme.decode(dec_plain);
+    auto victim_arr = use_modified_decoding ? my_decode_alloc(context, victim) :
+                      scheme.decode(victim);
 
     utils::element_wise_mult_inplace(plain_vec, plain_vec);
 
@@ -378,10 +398,22 @@ int main(int argc, char *argv[]) {
         printf("rel error = %f\n", utils::relative_error(plain_vec_dst, dec_vec));
     }
 
+    std::vector<cmpl64> victim_vec(victim_arr, victim_arr + slots);
+    delete[] victim_arr;
+    // defense precision
+    if (defense_flag.getValue()) {
+        if (func_type == utils::F_VARIANCE) {
+            printf("def max error = %f\n", utils::max_error_1vN((std::complex<double>) var, victim_vec));
+            printf("def rel error = %f\n", utils::max_rel_error_1vN((std::complex<double>) var, victim_vec));
+        } else {
+            printf("def max error = %f\n", utils::max_error(plain_vec_dst, victim_vec));
+            printf("def rel error = %f\n", utils::relative_error(plain_vec_dst, victim_vec));
+        }
+    }
 
     // attack
     long common_levels = use_crt_construction ? homo_res.l : 1;
-    auto re_encoded = my_encode_alloc(context, dec_vec.data(), slots, common_levels);
+    auto re_encoded = my_encode_alloc(context, victim_vec.data(), slots, common_levels);
     std::cout << "re-encoding ok? " << isSame(re_encoded.mx, dec_plain.mx, common_levels, context.N) << '\n';
 
     std::cout << "max encoding error: " << maxCoeffError(context, re_encoded.mx, dec_plain.mx) << '\n';
