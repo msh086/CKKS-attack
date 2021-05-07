@@ -335,7 +335,7 @@ int main(int argc, char *argv[]) {
      *
      * Decoding:
      *  defense is already present
-     *  the stddev in Gaussian Distribution is 2 * (the stddev of the image part in message vector)
+     *  the stddev in Gaussian Distribution is sqrt(2) * (the stddev of the image part in message vector)
      *  the image part is cleared at the end of decoding for defense
      *
      * NOTE: defense noise
@@ -355,7 +355,7 @@ int main(int argc, char *argv[]) {
      * 2. compute the stddev of the n-1 non-zero coefficients of (msg - msg')/2
      * 3. if stddev < sqrt(n)/8, stddev := sqrt(n)/8 FIXME: why?
      * 4. if log2(stddev) > p - 10, throw an exception that precision is less than 10 bits FIXME: why?
-     * 5. stddev := (M + 1) * stddev, where M defaults to 1
+     * 5. stddev := sqrt(M + 1) * stddev, where M defaults to 1
      * 6. compute (msg + msg')/2
      * 7. add gaussian noise to each coefficient in the polynomial above
      * 8. perform decoding fft (canonical embedding)
