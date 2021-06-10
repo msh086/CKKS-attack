@@ -19,8 +19,14 @@
 #include "tclap/CmdLine.h"
 #include "utils.h"
 
+//#define PRINTDEBUG
+
+#ifdef PRINTDEBUG
 #define PRINTERROR(err) std::cerr << "In function " << __FUNCTION__  << " at line " << __LINE__ << ": "\
     << e.what() << std::endl;
+#else
+#define PRINTERROR(arr)
+#endif
 
 
 void printParams(const Plaintext &plaintext) {
@@ -311,6 +317,45 @@ NTL::ZZ_pE recoverByTrick(const NTL::ZZ_pE &m, const NTL::ZZ_pE &a, const NTL::Z
     return (-2) * convModUp(h2) + convModUp(s2);
 }
 
+void init_rings(long N, long logq){
+    // init rings
+    NTL::ZZ_p::init(NTL::ZZ(1) << logq);
+    NTL::ZZX PhiM;
+    PhiM.SetLength(N + 1);
+    PhiM[0] = 1;
+    PhiM[N] = 1;
+    NTL::ZZ_pE::init(NTL::conv<NTL::ZZ_pX>(PhiM));
+    NTL::GF2E::init(NTL::conv<NTL::GF2X>(PhiM));
+}
+
+NTL::ZZ_pE recoverByExtendedTrick(const NTL::ZZ_pE &m, const NTL::ZZ_pE &a, const NTL::ZZ_pE &b, int bits) {
+    NTL::ZZ_pE res(0);
+    NTL::ZZ_pE rhs = m - b;
+    NTL::GF2E a2 = convModDown(a);
+    NTL::GF2E a2inv;
+    try{
+        NTL::inv(a2inv, a2);
+    } catch (NTL::ErrorObject &e){
+        PRINTERROR(e)
+        return NTL::ZZ_pE();
+    }
+    // as = rhs
+    NTL::ZZ_p shifter(1);
+    for(int i = 0; i < bits; i++, shifter *= 2){
+        auto rhs2 = convModDown(rhs);
+        auto cur_bit = convModUp(rhs2 * a2inv); // ZZ_pE with coeffs of 0,1
+        res += cur_bit * shifter;
+        rhs = convRing(deconvRing(rhs - a * cur_bit) / 2);
+    }
+    return res;
+}
+
+NTL::ZZ_pE recoverByNTRUInvBounded(const NTL::ZZ_pE &m, const NTL::ZZ_pE &a, const NTL::ZZ_pE &b, int bits){
+    auto m0 = deconvRing(m), a0 = deconvRing(a), b0 = deconvRing(b);
+    NTL::ZZ_pPush backup(NTL::ZZ(1) << bits);
+    return recoverByNTRUInv(convRing(m0), convRing(a0), convRing(b0));
+}
+
 /**
  * perform Monte Carlo simulation to test the probability that an uniformly drawn sample from R_q is invertible
  * under the Extended Euclidean Algorithm, where q is a power of 2
@@ -372,6 +417,89 @@ bool checkSame(const Plaintext &p1, const Plaintext &p2) {
     return true;
 }
 
+uint64_t rdtsc()
+{
+    uint32_t lo,hi;
+
+    __asm__ __volatile__
+    (
+    "rdtsc":"=a"(lo),"=d"(hi)
+    );
+    return (uint64_t)hi<<32|lo;
+}
+
+bool benchmark(Ring &ring, uint64_t *time_fast_alg_ptr, uint64_t *time_ntru_alg_ptr, uint64_t *success_ptr, uint64_t ntimes=1000){
+    auto s_arr = new NTL::ZZ[ring.N];
+    uint64_t time_fast_alg = 0, time_ntru_alg = 0, success = 0;
+    for(int i = 0; i < ntimes; i++){
+        // init
+        NTL::ZZ_pE s, m, a, b;
+        ring.sampleHWT(s_arr);
+        s = convRing(composeZZArray(s_arr, ring.N));
+        NTL::random(m);
+        NTL::random(a);
+        b = m - a * s;
+        // benchmark
+        uint64_t start = rdtsc();
+        auto fast_res = recoverByTrick(m, a, b);
+        uint64_t end = rdtsc();
+        time_fast_alg += end - start;
+        start = rdtsc();
+        auto ntru_res = recoverByNTRUInv(m, a, b);
+        end = rdtsc();
+        time_ntru_alg += end - start;
+        if(ntru_res != fast_res)
+            return false;
+        if(ntru_res == s)
+            success++;
+    }
+    *time_fast_alg_ptr = time_fast_alg;
+    *time_ntru_alg_ptr = time_ntru_alg;
+    *success_ptr = success;
+    return true;
+}
+
+/**
+ * benchmark between extended Li-Micciancio algorithm and bounded NTRU algorithm
+ * */
+bool benchmarkExt(Ring &ring, uint64_t *time_fast_alg_ptr, uint64_t *time_ntru_alg_ptr, uint64_t *success_ptr, int bits, uint64_t ntimes=1000){
+    uint64_t time_fast_alg = 0, time_ntru_alg = 0, success = 0;
+    auto ring_dim = NTL::ZZ_pE::modulus().n;
+    for(int i = 0; i < ntimes; i++){
+        // init
+        NTL::ZZ_pE s, m, a, b;
+        NTL::ZZX s0;
+        s0.SetLength(ring_dim);
+        for(int j = 0; j < ring_dim; j++)
+            s0[j] = NTL::RandomBits_ZZ(bits);
+        s = convRing(s0);
+        NTL::random(m);
+        NTL::random(a);
+        b = m - a * s;
+        // benchmark
+        uint64_t start = rdtsc();
+        auto fast_res = recoverByExtendedTrick(m, a, b, bits);
+        uint64_t end = rdtsc();
+        time_fast_alg += end - start;
+        start = rdtsc();
+        auto ntru_res = recoverByNTRUInvBounded(m, a, b, bits);
+        end = rdtsc();
+        time_ntru_alg += end - start;
+        if(ntru_res != fast_res) {
+            auto check = recoverByNTRUInv(m, a, b);
+            printf("ntru ok? %ld; fast ok? %ld; check ok? %ld\n", ntru_res == s, fast_res == s,
+                   check == s);
+            return false;
+        }
+        if(ntru_res == s)
+            success++;
+    }
+    *time_fast_alg_ptr = time_fast_alg;
+    *time_ntru_alg_ptr = time_ntru_alg;
+    *success_ptr = success;
+    return true;
+}
+
 int main(int argc, char *argv[]) {
     // cmd arguments parsing
     TCLAP::CmdLine cmdLine("HEAAN attack&defense", ' ');
@@ -402,6 +530,11 @@ int main(int argc, char *argv[]) {
 
     TCLAP::SwitchArg defense_flag("d", "defense", "run defense", cmdLine);
 
+    TCLAP::SwitchArg benchmark_flag("b", "benchmark", "benchmark two attack algorithm", cmdLine);
+    TCLAP::SwitchArg ext_benchark_flag("", "extbenchmark", "benchmark improved algorithms", cmdLine);
+    TCLAP::ValueArg<uint64_t> ext_benchmark_bits_flag("", "extbits", "number of bits of s in ext benchmark", false, 1, "positive integer", cmdLine);
+    TCLAP::ValueArg<uint64_t> benchmark_round_flag("", "benchround", "rounds to run in benchmark", false, 1000, "positive integer", cmdLine);
+
     cmdLine.parse(argc, argv);
 
     auto timestamp = seed_flag.getValue();
@@ -418,6 +551,50 @@ int main(int argc, char *argv[]) {
 
     // Construct and Generate Public Keys //
     Ring ring(logN, logQ);
+
+    // run benchmark
+    if(benchmark_flag.getValue() && benchmark_round_flag.getValue()){
+        init_rings(ring.N, logQ);
+        auto n_rounds = benchmark_round_flag.getValue();
+        uint64_t time_fast_alg, time_ntru_alg, success_count;
+        bool ok = benchmark(ring, &time_fast_alg, &time_ntru_alg, &success_count, n_rounds);
+        if(ok){
+            printf("benchmark with N = %ld, logQ = %ld ok, two algorithms gave the same results\n", ring.N, logQ);
+            printf("success/total = %lu/%lu = %f\n", success_count, n_rounds, (double)success_count/n_rounds);
+            printf("average cycles for fast alg: %lu\n", time_fast_alg / n_rounds);
+            printf("average cycles for ntru alg: %lu\n", time_ntru_alg / n_rounds);
+        }
+        else{
+            printf("something wrong in benchmark, two algorithms gave different results\n");
+        }
+        return 0;
+    }
+
+    if(ext_benchark_flag.getValue() && ext_benchmark_bits_flag.getValue() && benchmark_round_flag.getValue()){
+        init_rings(ring.N, logQ);
+        auto ext_bits = ext_benchmark_bits_flag.getValue();
+        if(ext_bits > logQ){
+            fprintf(stderr, "warning: ext_bits = %ld > logQ = %ld\n", ext_bits, logQ);
+            ext_bits = logQ;
+        }
+        auto n_rounds = benchmark_round_flag.getValue();
+        uint64_t time_fast_alg, time_ntru_alg, success_count;
+        bool ok = benchmarkExt(ring, &time_fast_alg, &time_ntru_alg, &success_count,
+                                    ext_benchmark_bits_flag.getValue(),
+                                    n_rounds);
+        if(ok){
+            printf("benchmark with N = %ld, logQ = %ld, bits = %ld ok, two algorithms gave the same results\n",
+                   ring.N, logQ, ext_bits);
+            printf("success/total = %lu/%lu = %f\n", success_count, n_rounds, (double)success_count/n_rounds);
+            printf("average cycles for fast alg: %lu\n", time_fast_alg / n_rounds);
+            printf("average cycles for ntru alg: %lu\n", time_ntru_alg / n_rounds);
+        }
+        else{
+            printf("something wrong in benchmark, two algorithms gave different results\n");
+        }
+        return 0;
+    }
+
     /**
      * hamming weight defaults to 64
      * each non-zero coefficient of secret key has value of 1 or -1 with uniform possibility
@@ -516,14 +693,7 @@ int main(int argc, char *argv[]) {
         //     (note that logErrBound defaults to 0)
         //  4. add gaussian noise with stddev of sigma2 to each coefficient of message
 
-        // init rings
-        NTL::ZZ_p::init(NTL::ZZ(1) << victim.logq);
-        NTL::ZZX PhiM;
-        PhiM.SetLength(ring.N + 1);
-        PhiM[0] = 1;
-        PhiM[ring.N] = 1;
-        NTL::ZZ_pE::init(NTL::conv<NTL::ZZ_pX>(PhiM));
-        NTL::GF2E::init(NTL::conv<NTL::GF2X>(PhiM));
+        init_rings(ring.N, victim.logq);
 
         auto m_ring = convRing(composeZZArray(re_encoded.mx, ring.N));
         auto b_ring = convRing(composeZZArray(victim.bx, ring.N));
