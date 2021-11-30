@@ -1,0 +1,155 @@
+From ef9e549b2a9d818bd92a331c446a603433f697b2 Mon Sep 17 00:00:00 2001
+From: msh086 <1729092048@qq.com>
+Date: Fri, 12 Feb 2021 14:21:05 +0800
+Subject: [PATCH] add functions for ckks key recovery
+
+---
+ .gitignore            | 23 +++++++++++++++++++++++
+ include/helib/Ctxt.h  |  8 ++++++++
+ include/helib/keys.h  |  6 ++++++
+ include/helib/norms.h | 10 ++++++++++
+ src/norms.cpp         | 40 ++++++++++++++++++++++++++++++++++++++++
+ 5 files changed, 87 insertions(+)
+
+diff --git a/.gitignore b/.gitignore
+index 83f8ba2..d972551 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -38,3 +38,26 @@ src/*.txt
+ 
+ /html/
+ /latex/
++
++# Build and install files
++CMakeFiles/
++CTestTestfile.cmake
++Makefile
++Testing/
++bin/
++cmake_install.cmake
++install_manifest.txt
++lib/
++src/CMakeFiles/
++src/CTestTestfile.cmake
++src/cmake_install.cmake
++src/googletest-build/
++src/googletest-download/
++src/googletest-src/
++src/helib/
++src/helibConfig.cmake
++src/helibConfigVersion.cmake
++src/tests/
++src/version.cpp
++test_resources/
++xunit_test_result/
+diff --git a/include/helib/Ctxt.h b/include/helib/Ctxt.h
+index 4e4ab97..17884c2 100644
+--- a/include/helib/Ctxt.h
++++ b/include/helib/Ctxt.h
+@@ -527,6 +527,14 @@ public:
+   //! on the L-infty norm of the canonical embedding
+   void DummyEncrypt(const NTL::ZZX& ptxt, double size = -1.0);
+ 
++  /**
++   * Access ciphertext parts
++   * NOTE: this is not in the original library, it's added to perform CKKS attack
++   * */
++  DoubleCRT& operator[](size_t idx){
++      return parts[idx];
++  }
++
+   Ctxt& operator=(const Ctxt& other)
+   { // public assignment operator
+     assertEq(&context,
+diff --git a/include/helib/keys.h b/include/helib/keys.h
+index b177ca7..ce054d0 100644
+--- a/include/helib/keys.h
++++ b/include/helib/keys.h
+@@ -295,6 +295,12 @@ private:
+   explicit SecKey(const PubKey& pk);
+ 
+ public:
++    /**
++     * make sk public
++     * */
++    DoubleCRT& getSK(){
++        return sKeys[0];
++    }
+   /**
+    * @brief Class label to be added to JSON serialization as object type
+    * information.
+diff --git a/include/helib/norms.h b/include/helib/norms.h
+index 3c367e9..52b3cb5 100644
+--- a/include/helib/norms.h
++++ b/include/helib/norms.h
+@@ -123,6 +123,16 @@ void CKKS_embedInSlots(zzX& f,
+                        const PAlgebra& palg,
+                        double scaling);
+ 
++
++/**
++ * This function is not in the original library
++ * it is added to handle the possible overflow when encoding into a vector of long
++ * NOTE: when overflow happens, the truncation error in decoding itself is enough to cause recovery failure
++ * */
++void CKKS_embedInSlots(NTL::ZZX& f,
++                       const std::vector<cx_double>& v,
++                       const PAlgebra& palg,
++                       double scaling);
+ } // namespace helib
+ 
+ #endif // ifndef HELIB_NORMS_H
+diff --git a/src/norms.cpp b/src/norms.cpp
+index fbb7b76..f4e3303 100644
+--- a/src/norms.cpp
++++ b/src/norms.cpp
+@@ -614,6 +614,46 @@ void CKKS_embedInSlots(zzX& f,
+   normalize(f);
+ }
+ 
++    void CKKS_embedInSlots(NTL::ZZX& f,
++                           const std::vector<cx_double>& v,
++                           const PAlgebra& palg,
++                           double scaling)
++
++    {
++        HELIB_TIMER_START;
++
++        long v_sz = v.size();
++        long m = palg.getM();
++
++        if (!(palg.getP() == -1 && palg.getPow2() >= 2))
++            throw LogicError("bad args to CKKS_canonicalEmbedding");
++
++        std::vector<cx_double> buf(m / 2, cx_double(0));
++        for (long i : range(m / 4)) {
++            long j = palg.ith_rep(i);
++            long ii = m / 4 - i - 1;
++            if (ii < v_sz) {
++                buf[j >> 1] = std::conj(v[ii]);
++                buf[(m - j) >> 1] = v[ii];
++            }
++        }
++
++        const half_FFT& hfft = palg.getHalfFFTInfo();
++        const cx_double* pow = &hfft.pow[0];
++
++        scaling /= (m / 2);
++        // This is becuase DFT^{-1} = 1/(m/2) times a DFT matrix for conj(V)
++
++        hfft.fft.apply(&buf[0]);
++        f.SetLength(m / 2);
++        for (long i : range(m / 2)) {
++            double f_i = std::round(MUL(buf[i], pow[i]).real() * scaling);
++            NTL::conv(f[i], f_i);
++        }
++
++        f.normalize();
++    }
++
+ // === obsolete versions of canonical embedding and inverse ===
+ 
+ // These are less efficient, and seem to have some logic errors.
+-- 
+2.25.1
+

@@ -1,0 +1,4 @@
+bound for standard normal distribution: 3.300000, required precision: 0.010000, significant level: 0.999033
+sample size: 27215
+guessed EEA-invertible probability: 0.000200
+confidence interval: (0.000000, 0.000400)

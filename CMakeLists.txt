@@ -39,3 +39,22 @@ add_executable(heaanrnsattack my_code/heaanrnsmain.cpp my_code/utils.cpp my_code
 target_link_libraries(heaanrnsattack ntl pthread gmp)
 target_link_libraries(heaanrnsattack /home/msh/CKKS/FullRNS-HEAAN/lib/libFRNSHEAAN.a)
 target_include_directories(heaanrnsattack PRIVATE FullRNS-HEAAN/src)
+
+# palisade attack
+add_executable(palisadeattack my_code/palisademain.cpp my_code/utils.cpp my_code/utils.h)
+find_package(Palisade)
+target_link_libraries(palisadeattack ${PALISADE_LIBRARIES} ntl gmp)
+target_link_directories(palisadeattack PRIVATE ${PALISADE_LIBDIR} PRIVATE ${OPENMP_LIBRARIES})
+set(PALISADE_DIR /home/msh/CKKS/palisade-release/src)
+
+message("${PALISADE_INCLUDE}")
+
+set(PALISADE_INCLUDE /home/msh/CKKS/palisade-release/src)
+set(PALISADE_THIRD_PARTY /home/msh/CKKS/palisade-release/third-party)
+
+target_include_directories(palisadeattack PRIVATE
+#        ${PALISADE_INCLUDE}/third-party/include
+        ${PALISADE_INCLUDE}/core/include
+        ${PALISADE_INCLUDE}/pke/include
+        ${PALISADE_THIRD_PARTY}/cereal/include
+        )
